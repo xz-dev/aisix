@@ -57,7 +57,11 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: api7/aisix
+  # The fork publishes to its own GHCR namespace (api7 publishes to
+  # api7/aisix); ghcr.io/<owner>/<repo> is where the fork's GITHUB_TOKEN has
+  # packages:write, so derive it from the repository instead of the upstream
+  # hardcode. Docker Hub mirroring stays an upstream-release-tag concern.
+  IMAGE_NAME: ${{ github.repository }}
 
 permissions:
   contents: read
@@ -580,6 +584,32 @@ jobs:
           TAGS="$(cat "$RUNNER_TEMP/tagset/tags.txt")"
           test -n "$TAGS" \
             || { echo "::error::empty tag set — nothing would be published"; exit 1; }
+          # Fork addition — immutable scratch tags. A ci-test-* tag must
+          # never be reassigned to different content. Fail closed: only a
+          # confirmed "manifest unknown" (the tag does not exist yet) may
+          # publish; auth, transport or unexpected failures abort before any
+          # `imagetools create` runs. Runs after GHCR login and after both
+          # arch digests exist, but BEFORE the first tag is assigned.
+          for ref in $TAGS; do
+            repo="${ref%:*}"
+            tag="${ref##*:}"
+            case "$tag" in
+              ci-test-*) ;;
+              *) continue ;;
+            esac
+            if lookup_error="$(docker buildx imagetools inspect "$ref" 2>&1)"; then
+              echo "::error::refusing to overwrite existing scratch tag ${ref}"; exit 1
+            else
+              lookup_status=$?
+            fi
+            case "$lookup_status:$lookup_error" in
+              "1:ERROR: $ref: not found"|"1:ERROR: $ref: manifest unknown")
+                echo "Verified that ${ref} does not exist yet." ;;
+              *)
+                printf '::error::tag check for %s did not positively confirm absence (exit %s)\n%s\n' "$ref" "$lookup_status" "$lookup_error" >&2
+                exit "$lookup_status" ;;
+            esac
+          done
           repos=""
           for ref in $TAGS; do
             repo="${ref%:*}"
