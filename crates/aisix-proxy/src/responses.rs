@@ -3189,6 +3189,69 @@ fn responses_sse_provider_request_id(bytes: &[u8]) -> String {
     String::new()
 }
 
+/// The message a verbatim stream is failed with when the upstream ended it
+/// — cleanly or not — before any terminal event. Names the cause the way
+/// clients that retry on it read it.
+const PASSTHROUGH_TRUNCATED_MESSAGE: &str =
+    "upstream stream ended before a terminal event (response.completed, response.incomplete or response.failed)";
+
+/// What the verbatim relay needs at end-of-stream to close a stream in
+/// protocol terms: whether the upstream already sent a terminal event, and
+/// the last `sequence_number` it used, so a synthesized close continues it.
+#[derive(Default)]
+struct PassthroughEnd {
+    terminal_seen: bool,
+    last_seq: Option<u64>,
+}
+
+impl PassthroughEnd {
+    /// Feed one parsed upstream event.
+    fn observe(&mut self, json: &Value) {
+        if let Some(seq) = json.get("sequence_number").and_then(Value::as_u64) {
+            self.last_seq = Some(seq);
+        }
+        if matches!(
+            json.get("type").and_then(Value::as_str),
+            Some(
+                "response.completed"
+                    | "response.incomplete"
+                    | "response.failed"
+                    | "response.cancelled"
+                    | "error"
+            )
+        ) {
+            self.terminal_seen = true;
+        }
+    }
+
+    /// The frames that close a stream the upstream left without a terminal
+    /// event: the flat `error` event, then `response.failed` — the event a
+    /// Responses client builds its final state from. Same pair, same code
+    /// and the same message in both, as the cross-provider bridge sends for
+    /// a mid-stream failure, so a client can tell a cut-off answer from a
+    /// finished one and retry it instead of keeping a truncated turn.
+    fn failure_frames(&self, response_id: &str, model: &str, message: &str) -> bytes::Bytes {
+        const CODE: &str = "upstream_error";
+        let seq = self.last_seq.map_or(0, |s| s + 1);
+        let error = serde_json::json!({
+            "type": "error", "code": CODE, "message": message,
+            "param": Value::Null, "sequence_number": seq,
+        });
+        let failed = serde_json::json!({
+            "type": "response.failed",
+            "sequence_number": seq + 1,
+            "response": {
+                "id": response_id, "object": "response", "status": "failed",
+                "model": model, "output": [],
+                "error": {"code": CODE, "message": message},
+            },
+        });
+        bytes::Bytes::from(format!(
+            "event: error\ndata: {error}\n\nevent: response.failed\ndata: {failed}\n\n"
+        ))
+    }
+}
+
 /// Drain every complete SSE frame from `buf`, updating `acc` with the latest
 /// terminal-event usage (#808) and feeding each parsed event to the optional
 /// content capture (AISIX-Cloud#947). A frame ends at the first blank line;
@@ -3214,6 +3277,7 @@ fn drain_responses_sse_frames(
     first_frame_seen: &mut bool,
     client_facing_model: &str,
     mark: &crate::responses_affinity::ResponseMark,
+    stream_end: &mut PassthroughEnd,
     out: &mut Vec<u8>,
 ) {
     while let Some(end) = aisix_gateway::sse::find_frame_end(buf) {
@@ -3241,6 +3305,7 @@ fn drain_responses_sse_frames(
                 continue;
             }
             if let Ok(json) = serde_json::from_str::<Value>(data) {
+                stream_end.observe(&json);
                 // First parsed frame of ANY type (`response.created`
                 // included) → upstream TTFT. The industry convention
                 // (LiteLLM, caller-side gateways) stamps the same event, so
@@ -3549,6 +3614,8 @@ where
         futures::pin_mut!(upstream);
         let mut buf: Vec<u8> = Vec::new();
         let mut first_frame_seen = upstream_ttft_ms.is_some();
+        let mut end = PassthroughEnd::default();
+        let mut upstream_failed = false;
         while let Some(item) = upstream.next().await {
             if let Ok(bytes) = &item {
                 // Accumulate, then drain every COMPLETE frame — restamped with
@@ -3566,6 +3633,7 @@ where
                     &mut first_frame_seen,
                     &client_facing_model,
                     &mark,
+                    &mut end,
                     &mut forward,
                 );
                 // Bound the frame buffer: the happy path drains complete frames
@@ -3608,7 +3676,10 @@ where
                 yield Ok(bytes::Bytes::from(forward));
                 continue;
             }
-            // A mid-stream Err is forwarded as-is.
+            // A mid-stream Err is not forwarded: an Err item aborts the
+            // client's body mid-frame, a close with no terminal event that a
+            // client cannot tell from a dropped connection. It is recorded
+            // and the stream is failed in protocol terms below.
             if let Err(e) = &item {
                 let (usage_acc, _) = guard.parts();
                 crate::attempt::StreamFailure::record(
@@ -3616,7 +3687,8 @@ where
                     &crate::dispatch::reqwest_error_to_bridge(e, attempt_started),
                 );
             }
-            yield item;
+            upstream_failed = true;
+            break;
         }
         if let Some(e) = read_timeout.fired() {
             let (usage_acc, _) = guard.parts();
@@ -3635,6 +3707,11 @@ where
         // `response.completed` — the event an SDK builds its final Response
         // object from. Same reasoning as `model_echo::restamp_sse_buffer`,
         // and this path reaches it without any guardrail attached.
+        // After a failed read the tail is a frame cut off mid-way, not one the
+        // upstream finished: drop it rather than hand the client half a JSON.
+        if upstream_failed {
+            buf.clear();
+        }
         if !buf.is_empty() {
             // Parse it before releasing it. On this surface the unterminated
             // final frame is `response.completed`, which carries the
@@ -3662,6 +3739,7 @@ where
                 &mut first_frame_seen,
                 &client_facing_model,
                 &mark,
+                &mut end,
                 &mut drained,
             );
             let tail = match drained.len().checked_sub(pad.len()) {
@@ -3676,6 +3754,34 @@ where
                     crate::attempt::measured_ms(started.elapsed());
             }
             yield Ok(bytes::Bytes::from(tail));
+        }
+        // The upstream ended — by EOF, a read error or the read timeout —
+        // without a terminal event. Ending the body here would hand the
+        // client a clean EOF on a response that never finished, which it
+        // can only take as a dropped connection. Fail it explicitly instead:
+        // the usage event records the cut-off as a stream failure (not a
+        // 200), and usage stays whatever was observed or estimated.
+        if !end.terminal_seen {
+            let (usage_acc, _) = guard.parts();
+            let acc = usage_acc.get_or_insert_with(Default::default);
+            if acc.failure.is_none() {
+                acc.failure = Some(crate::attempt::StreamFailure {
+                    error_message: PASSTHROUGH_TRUNCATED_MESSAGE.to_string(),
+                    ..crate::attempt::StreamFailure::from_bridge(
+                        &aisix_gateway::BridgeError::StreamAborted,
+                    )
+                });
+            }
+            let message = acc
+                .failure
+                .as_ref()
+                .map(|f| f.error_message.clone())
+                .unwrap_or_else(|| PASSTHROUGH_TRUNCATED_MESSAGE.to_string());
+            if acc.downstream_latency_ms == 0 {
+                acc.downstream_latency_ms = crate::attempt::measured_ms(started.elapsed());
+            }
+            let frames = end.failure_frames(&acc.provider_request_id, &client_facing_model, &message);
+            yield Ok(frames);
         }
         // Upstream EOF — the response was delivered in full. Record that
         // before the scan below, which awaits a remote provider and is a
@@ -7666,6 +7772,7 @@ data: [DONE]\n\n";
             &mut first,
             "client-facing",
             &Default::default(),
+            &mut super::PassthroughEnd::default(),
             &mut out,
         );
         let usage = acc.expect("the terminal frame must be parsed");
@@ -7694,6 +7801,7 @@ data: [DONE]\n\n";
             &mut first,
             "client-facing",
             &Default::default(),
+            &mut super::PassthroughEnd::default(),
             &mut out,
         );
         let usage = acc.expect("a CRLF terminal frame must be parsed");
@@ -7823,5 +7931,165 @@ data: [DONE]\n\n";
             Some("resp_stream"),
             "the id rides the terminal frame, which only the end-of-stream line can see",
         );
+    }
+}
+
+/// The verbatim relay closes every stream with a terminal event
+/// (production: upstreams that ended a stream after `response.created` and
+/// deltas, with no `response.completed`, reached the client as a clean EOF
+/// while the usage line said `200`).
+#[cfg(test)]
+mod passthrough_terminal_tests {
+    use super::*;
+    use futures::StreamExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const HEAD: &[u8] = b"event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_cut\",\"model\":\"m\"}}\n\n\
+event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"delta\":\"hello\"}\n\n";
+    const DONE: &[u8] = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":2,\"response\":{\"id\":\"resp_cut\",\"model\":\"m\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1,\"total_tokens\":4}}}\n\n";
+
+    /// A real reqwest body stream from a raw server that writes a chunked
+    /// body and then closes without the final chunk; `rst` resets instead
+    /// of FIN. reqwest reports the cut as an Err item either way.
+    async fn cut_upstream(
+        body: &'static [u8],
+        rst: bool,
+    ) -> impl futures::Stream<Item = reqwest::Result<bytes::Bytes>> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut req = [0u8; 4096];
+            let _ = s.read(&mut req).await;
+            let mut out = b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n".to_vec();
+            out.extend_from_slice(format!("{:x}\r\n", body.len()).as_bytes());
+            out.extend_from_slice(body);
+            out.extend_from_slice(b"\r\n");
+            s.write_all(&out).await.unwrap();
+            s.flush().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            if rst {
+                s.set_zero_linger().unwrap();
+            }
+            drop(s);
+        });
+        reqwest::get(format!("http://{addr}/"))
+            .await
+            .unwrap()
+            .bytes_stream()
+    }
+
+    /// Run the relay to the end: the client bytes, whether any Err item
+    /// reached the client, and the failure the usage event records.
+    async fn relay<S>(upstream: S) -> (String, bool, Option<crate::attempt::StreamFailure>)
+    where
+        S: futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send + 'static,
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let now = Instant::now();
+        let stream = build_responses_passthrough_stream(
+            upstream,
+            crate::stream_timeout::ReadTimeoutSignal::default(),
+            now,
+            now,
+            None,
+            None,
+            None,
+            "m".to_string(),
+            Default::default(),
+            move |usage: ResponseUsage, _, _| {
+                let _ = tx.send(usage.failure);
+            },
+        );
+        let items: Vec<_> = stream.collect().await;
+        let saw_err = items.iter().any(|i| i.is_err());
+        let wire: Vec<u8> = items
+            .into_iter()
+            .filter_map(Result::ok)
+            .flat_map(|b| b.to_vec())
+            .collect();
+        (
+            String::from_utf8(wire).unwrap(),
+            saw_err,
+            rx.recv().unwrap(),
+        )
+    }
+
+    fn last_event_type(wire: &str) -> String {
+        wire.split("\n\n")
+            .filter_map(|f| f.lines().find_map(|l| l.strip_prefix("data: ")))
+            .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+            .filter_map(|v| v.get("type").and_then(Value::as_str).map(str::to_string))
+            .last()
+            .unwrap_or_default()
+    }
+
+    fn assert_failed_close(
+        wire: &str,
+        saw_err: bool,
+        failure: Option<crate::attempt::StreamFailure>,
+    ) {
+        assert!(!saw_err, "an Err item aborts the client's body: {wire}");
+        assert_eq!(last_event_type(wire), "response.failed", "{wire}");
+        assert!(wire.contains("event: error\n"), "{wire}");
+        assert!(
+            wire.contains("\"id\":\"resp_cut\""),
+            "the failed response names the upstream id: {wire}"
+        );
+        assert!(
+            wire.contains("\"sequence_number\":2"),
+            "the close continues the upstream sequence: {wire}"
+        );
+        let failure = failure.expect("the cut-off is a stream failure, not a 200");
+        assert_eq!(failure.status, 502);
+    }
+
+    /// Shapes b/f: the upstream ends cleanly (FIN, final chunk) after
+    /// content with no terminal event. Reproduced on 06e80752: 200 log, no
+    /// terminal on the wire.
+    #[tokio::test]
+    async fn clean_eof_without_terminal_is_failed_explicitly() {
+        let upstream = futures::stream::iter(vec![Ok(bytes::Bytes::from_static(HEAD))]);
+        let (wire, saw_err, failure) = relay(upstream).await;
+        assert!(
+            wire.starts_with(std::str::from_utf8(HEAD).unwrap()),
+            "{wire}"
+        );
+        assert_failed_close(&wire, saw_err, failure.clone());
+        assert!(wire.contains(PASSTHROUGH_TRUNCATED_MESSAGE), "{wire}");
+    }
+
+    /// Shapes a/e: the upstream resets (or FINs without the last chunk)
+    /// before a terminal event. Reproduced on 06e80752: the Err item was
+    /// forwarded and aborted the client's body mid-frame.
+    #[tokio::test]
+    async fn upstream_cut_without_terminal_is_failed_explicitly() {
+        for rst in [true, false] {
+            let (wire, saw_err, failure) = relay(cut_upstream(HEAD, rst).await).await;
+            assert_failed_close(&wire, saw_err, failure);
+        }
+    }
+
+    /// A cut after `response.completed` (shape c) already delivered the
+    /// answer: nothing is appended and the client keeps a clean body.
+    #[tokio::test]
+    async fn cut_after_terminal_appends_nothing() {
+        static BODY: std::sync::LazyLock<Vec<u8>> =
+            std::sync::LazyLock::new(|| [HEAD, DONE].concat());
+        let (wire, saw_err, _) = relay(cut_upstream(BODY.as_slice(), true).await).await;
+        assert!(!saw_err, "{wire}");
+        assert_eq!(last_event_type(&wire), "response.completed", "{wire}");
+        assert!(!wire.contains("response.failed"), "{wire}");
+    }
+
+    /// A complete stream passes through byte for byte, with no failure.
+    #[tokio::test]
+    async fn complete_stream_is_unchanged() {
+        let body = [HEAD, DONE].concat();
+        let upstream = futures::stream::iter(vec![Ok(bytes::Bytes::from(body.clone()))]);
+        let (wire, saw_err, failure) = relay(upstream).await;
+        assert!(!saw_err);
+        assert_eq!(wire.as_bytes(), body.as_slice());
+        assert!(failure.is_none());
     }
 }
