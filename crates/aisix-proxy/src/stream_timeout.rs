@@ -111,8 +111,8 @@ where
                 Some(d) => match tokio::time::timeout(d, upstream.next()).await {
                     Ok(Some(item)) => yield item,
                     Ok(None) => break,
-                    // Read timeout mid-passthrough: truncate the forwarded
-                    // stream. We can't inject a typed error into opaque bytes.
+                    // Read timeout mid-passthrough: end the stream and record
+                    // it on `signal`; the consumer decides how to close it.
                     Err(_) => {
                         signal.0.store((d.as_millis() as u64).max(1), Ordering::Relaxed);
                         break;
