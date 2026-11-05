@@ -1539,43 +1539,22 @@ async fn responses_to_target(
     let status = upstream_resp.status();
 
     if !status.is_success() {
-        let status_u16 = status.as_u16();
-        let retry_after = aisix_gateway::parse_retry_after(upstream_resp.headers());
-        let headers = upstream_resp.headers().clone();
         // Bounded like any body read here: from the upload's end for a
         // non-streaming call (`body_until`), and by the stream deadline for a
-        // streaming one. An unreadable body reads as empty.
-        let stream_error_deadline = timeouts.stream.filter(|_| is_stream);
-        let body = crate::stream_timeout::body_within(body_until, send_started, async move {
-            match stream_error_deadline {
-                Some(d) => tokio::time::timeout(d, upstream_resp.bytes())
-                    .await
-                    .ok()
-                    .and_then(Result::ok),
-                None => upstream_resp.bytes().await.ok(),
-            }
-        })
+        // streaming one. A provider 413 or an inner hop refusal comes back as
+        // `BridgeError::UpstreamRelay` (D9): relayed unchanged, never retried,
+        // failed over or cooled down.
+        let err = crate::stream_timeout::body_within(
+            body_until,
+            send_started,
+            aisix_gateway::upstream_error_within(
+                timeouts.stream.filter(|_| is_stream),
+                upstream_resp,
+                aisix_provider_openai::held_route_http_error,
+            ),
+        )
         .await
-        .map_err(ProxyError::Bridge)?
-        .unwrap_or_default();
-        // A provider 413 or an inner hop refusal goes back unchanged, with no
-        // retry, failover or cooldown (D9).
-        if crate::capacity::relays_unchanged(status_u16, &body) {
-            return Err(ProxyError::UpstreamRelay(Box::new(
-                crate::error::UpstreamRelay {
-                    status: status_u16,
-                    headers,
-                    body,
-                },
-            )));
-        }
-        let err = aisix_gateway::upstream_status_of_body(
-            status_u16,
-            &body,
-            retry_after,
-            aisix_gateway::UpstreamWire::OpenAI,
-            aisix_provider_openai::parse_openai_error_envelope,
-        );
+        .map_err(ProxyError::Bridge)?;
         if let Some((ttl, reason)) = crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
         {
             state.runtime_status.mark_cooldown(model_id, ttl, reason);

@@ -611,10 +611,18 @@ where
 async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeError {
     let retry_after = aisix_gateway::parse_retry_after(resp.headers());
     let is_json = aisix_gateway::response_is_json(&resp);
+    let headers = resp.headers().clone();
     let aisix_gateway::UpstreamErrorBody {
         bytes: body,
         read_error,
     } = aisix_gateway::read_body_capped(resp, aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES).await;
+    // A provider 413 or an inner hop refusal goes back unchanged (D9); only
+    // a body that arrived whole is relayed, never a fragment.
+    if read_error.is_none() {
+        if let Some(relay) = aisix_gateway::upstream_relay(status.as_u16(), &headers, &body) {
+            return relay;
+        }
+    }
     // Only a body labelled JSON is read for `error.status`; this is Vertex's own
     // check, and `capture_upstream_error_http` parses whatever the label says.
     let kind = is_json.then(|| parse_vertex_error_status(&body)).flatten();

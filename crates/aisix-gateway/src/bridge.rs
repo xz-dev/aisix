@@ -475,6 +475,68 @@ pub enum BridgeError {
     Transport(String),
     #[error("upstream cancelled the response mid-stream")]
     StreamAborted,
+    /// An upstream error relayed to the caller with its status, headers
+    /// and body unchanged: a provider 413 or an inner hop refusal
+    /// ([`relays_unchanged`]). Request-scoped, so it is never retried,
+    /// failed over or counted toward cooldown or health.
+    #[error("upstream returned HTTP {}: {}", .0.status, .0.preview())]
+    UpstreamRelay(Box<UpstreamRelay>),
+}
+
+/// The upstream answer [`BridgeError::UpstreamRelay`] carries.
+#[derive(Debug)]
+pub struct UpstreamRelay {
+    pub status: u16,
+    pub headers: http::HeaderMap,
+    pub body: bytes::Bytes,
+}
+
+impl UpstreamRelay {
+    /// The body as text, capped like an `UpstreamStatus` message, for logs.
+    pub fn preview(&self) -> String {
+        let text = String::from_utf8_lossy(&self.body);
+        text.chars()
+            .take(MAX_UPSTREAM_ERROR_MESSAGE_BYTES)
+            .collect()
+    }
+}
+
+/// Whether an upstream error answer reaches the caller unchanged (D9): every
+/// provider 413, and an inner hop refusal — a JSON `error.code` in the
+/// capacity set plus an `error.hop`. Both are request-scoped: no retry,
+/// failover, cooldown or health stats.
+pub fn relays_unchanged(status: u16, body: &[u8]) -> bool {
+    if status == 413 {
+        return true;
+    }
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    let err = &v["error"];
+    let hop = err["hop"].as_str().is_some_and(|h| !h.is_empty());
+    let inner = err["code"].as_str().is_some_and(|c| {
+        matches!(
+            c,
+            "request_too_large" | "insufficient_storage" | "insufficient_memory" | "capacity_busy"
+        ) || c.starts_with("capacity_ticket_")
+    });
+    hop && inner
+}
+
+/// [`BridgeError::UpstreamRelay`] for a non-2xx upstream answer whose body
+/// has been read, when [`relays_unchanged`] says so.
+pub fn upstream_relay(
+    status: u16,
+    headers: &http::HeaderMap,
+    body: &bytes::Bytes,
+) -> Option<BridgeError> {
+    relays_unchanged(status, body).then(|| {
+        BridgeError::UpstreamRelay(Box::new(UpstreamRelay {
+            status,
+            headers: headers.clone(),
+            body: body.clone(),
+        }))
+    })
 }
 
 impl BridgeError {
@@ -615,7 +677,15 @@ pub async fn upstream_status_parsed_from_response(
 ) -> BridgeError {
     let status = resp.status().as_u16();
     let retry_after = parse_retry_after(resp.headers());
+    let headers = resp.headers().clone();
     let body = read_body_capped(resp, MAX_UPSTREAM_ERROR_BODY_BYTES).await;
+    // A provider 413 or an inner hop refusal goes back unchanged (D9); only
+    // a body that arrived whole is relayed, never a fragment.
+    if body.read_error.is_none() {
+        if let Some(relay) = upstream_relay(status, &headers, &body.bytes) {
+            return relay;
+        }
+    }
     upstream_status_of_body(status, body.whole(), retry_after, wire, parse)
         .with_body_read_error(body.read_error)
 }
@@ -680,10 +750,18 @@ pub async fn capture_upstream_error_http(
     parse: impl FnOnce(&[u8]) -> Option<UpstreamErrorView>,
 ) -> BridgeError {
     let retry_after = parse_retry_after(resp.headers());
+    let headers = resp.headers().clone();
     let UpstreamErrorBody {
         bytes: body,
         read_error,
     } = read_body_capped(resp, MAX_UPSTREAM_ERROR_BODY_BYTES).await;
+    // A provider 413 or an inner hop refusal goes back unchanged (D9); only
+    // a body that arrived whole is relayed, never a fragment.
+    if read_error.is_none() {
+        if let Some(relay) = upstream_relay(status.as_u16(), &headers, &body) {
+            return relay;
+        }
+    }
     // Parse the error envelope opportunistically, regardless of the
     // upstream's Content-Type (#543). OpenAI's 401 `invalid_api_key`
     // path (and edge / proxy layers fronting some upstreams) return the
@@ -1025,6 +1103,7 @@ impl BridgeError {
             BridgeError::InvalidUpstreamCredentials(_) => 401,
             BridgeError::Transport(_) => 502,
             BridgeError::StreamAborted => 502,
+            BridgeError::UpstreamRelay(r) => r.status,
         }
     }
 
@@ -1055,7 +1134,8 @@ impl BridgeError {
             | BridgeError::TokenExchangeDecode(_)
             | BridgeError::UpstreamInBand { .. }
             | BridgeError::Transport(_)
-            | BridgeError::StreamAborted => true,
+            | BridgeError::StreamAborted
+            | BridgeError::UpstreamRelay(_) => true,
             BridgeError::Config(_)
             | BridgeError::UnsupportedCapability(_)
             | BridgeError::InvalidUpstreamConfig(_)
@@ -1069,7 +1149,7 @@ impl BridgeError {
     pub fn error_type(&self) -> &'static str {
         match self {
             BridgeError::Timeout { .. } => "timeout",
-            BridgeError::UpstreamStatus { .. } => "upstream_error",
+            BridgeError::UpstreamStatus { .. } | BridgeError::UpstreamRelay(_) => "upstream_error",
             BridgeError::UpstreamDecode(_)
             | BridgeError::UpstreamBodyUnread { .. }
             | BridgeError::TokenExchangeDecode(_) => "upstream_decode_error",
@@ -1828,5 +1908,41 @@ mod tests {
     fn sample_model_resolves_to_openai() {
         let m = sample_model();
         assert_eq!(m.provider.as_deref(), Some("openai"));
+    }
+
+    #[test]
+    fn relays_unchanged_covers_413_and_inner_hop_errors_only() {
+        let inner = |code: &str, hop: &str| {
+            serde_json::json!({"error": {"message": "m", "type": "server_error", "code": code, "hop": hop}})
+                .to_string()
+        };
+        assert!(relays_unchanged(413, b"<html>too large</html>"));
+        for code in [
+            "request_too_large",
+            "insufficient_storage",
+            "insufficient_memory",
+            "capacity_busy",
+            "capacity_ticket_missing",
+            "capacity_ticket_invalid",
+        ] {
+            assert!(
+                relays_unchanged(503, inner(code, "cpa").as_bytes()),
+                "{code}"
+            );
+        }
+        // No hop, an empty hop or another code: today's handling.
+        assert!(!relays_unchanged(
+            503,
+            inner("insufficient_memory", "").as_bytes()
+        ));
+        assert!(!relays_unchanged(
+            503,
+            br#"{"error":{"message":"busy","code":"insufficient_memory"}}"#
+        ));
+        assert!(!relays_unchanged(
+            503,
+            inner("server_overloaded", "cpa").as_bytes()
+        ));
+        assert!(!relays_unchanged(503, b"upstream down"));
     }
 }

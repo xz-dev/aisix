@@ -112,28 +112,6 @@ impl CapacityError {
     }
 }
 
-/// Whether an upstream error answer reaches the caller unchanged (D9): every
-/// provider 413, and an inner hop refusal — a JSON `error.code` in the
-/// capacity set plus an `error.hop`. Both are request-scoped: no retry,
-/// failover, cooldown or health stats.
-pub(crate) fn relays_unchanged(status: u16, body: &[u8]) -> bool {
-    if status == 413 {
-        return true;
-    }
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return false;
-    };
-    let err = &v["error"];
-    let hop = err["hop"].as_str().is_some_and(|h| !h.is_empty());
-    let inner = err["code"].as_str().is_some_and(|c| {
-        matches!(
-            c,
-            "request_too_large" | "insufficient_storage" | "insufficient_memory" | "capacity_busy"
-        ) || c.starts_with("capacity_ticket_")
-    });
-    hop && inner
-}
-
 /// A shared lease on a capacity ticket. Dropping it closes the fd, which
 /// drops the kernel lock.
 #[derive(Debug)]

@@ -301,8 +301,6 @@ impl AttemptInfo {
 pub(crate) fn error_class(err: &ProxyError) -> &'static str {
     match err {
         ProxyError::Bridge(be) => routing_error_class(be),
-        // The upstream's own status answer, like `UpstreamStatus`.
-        ProxyError::UpstreamRelay(_) => "upstream_status",
         // Its `error.type` is the generic `api_error`, which would hide
         // the failure among every other gateway-side fault.
         ProxyError::SemanticDecisionFailed { .. } => "semantic_decision_failed",
@@ -315,7 +313,8 @@ pub(crate) fn error_class(err: &ProxyError) -> &'static str {
 pub(crate) fn routing_error_class(err: &BridgeError) -> &'static str {
     match err {
         BridgeError::Timeout { .. } => "timeout",
-        BridgeError::UpstreamStatus { .. } => "upstream_status",
+        // A relayed answer is still the upstream's own status answer.
+        BridgeError::UpstreamStatus { .. } | BridgeError::UpstreamRelay(_) => "upstream_status",
         BridgeError::UpstreamDecode(_)
         | BridgeError::UpstreamBodyUnread { .. }
         | BridgeError::TokenExchangeDecode(_) => "upstream_decode",
@@ -593,7 +592,7 @@ pub(crate) fn relayed_failure(status: u16, body: &[u8]) -> (&'static str, String
 pub(crate) fn attempt_reached_upstream(err: &ProxyError) -> bool {
     match err {
         ProxyError::Bridge(be) => be.reached_upstream(),
-        ProxyError::ContentFiltered { .. } | ProxyError::UpstreamRelay(_) => true,
+        ProxyError::ContentFiltered { .. } => true,
         ProxyError::MissingAuth(_)
         | ProxyError::MissingRouteAuthHeader(_)
         | ProxyError::InvalidApiKey
@@ -699,6 +698,11 @@ mod tests {
                 downloaded_bytes: 100,
             },
             BridgeError::InvalidUpstreamCredentials("provider_key.api_key is empty".into()),
+            BridgeError::UpstreamRelay(Box::new(aisix_gateway::UpstreamRelay {
+                status: 413,
+                headers: Default::default(),
+                body: bytes::Bytes::from_static(b"too large"),
+            })),
         ]
     }
 
@@ -724,6 +728,7 @@ mod tests {
             ("invalid_request_error", "invalid_request_error"),
             ("invalid_request_error", "invalid_request_error"),
             ("invalid_credentials", "authentication_error"),
+            ("upstream_status", "upstream_error"),
         ];
         let samples = bridge_error_samples();
         assert_eq!(samples.len(), expected.len());
@@ -758,7 +763,9 @@ mod tests {
                 // tried to reach the provider and could not. Excluding these
                 // would hide the outage the family exists to show.
                 BridgeError::Timeout { .. } => (true, "timeout"),
-                BridgeError::UpstreamStatus { .. } => (true, "upstream_status"),
+                BridgeError::UpstreamStatus { .. } | BridgeError::UpstreamRelay(_) => {
+                    (true, "upstream_status")
+                }
                 BridgeError::UpstreamDecode(_)
                 | BridgeError::UpstreamBodyUnread { .. }
                 | BridgeError::TokenExchangeDecode(_) => (true, "upstream_decode"),

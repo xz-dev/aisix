@@ -50,10 +50,11 @@ pub mod url_cache;
 pub use bridge::{
     capture_in_band_error, capture_in_band_error_value, capture_upstream_error_http,
     content_type_is_json, decode_success_body, in_band_error_body, in_band_error_in_body,
-    in_band_error_reported, parse_retry_after, read_body_capped, response_is_json, truncate_lossy,
-    upstream_error_message, upstream_error_within, upstream_status_of_body,
-    upstream_status_parsed_from_response, Bridge, BridgeCapability, BridgeContext, BridgeError,
-    ChatChunkStream, NativeMessages, UpstreamErrorBody, UpstreamErrorView, UpstreamWire,
+    in_band_error_reported, parse_retry_after, read_body_capped, relays_unchanged,
+    response_is_json, truncate_lossy, upstream_error_message, upstream_error_within,
+    upstream_relay, upstream_status_of_body, upstream_status_parsed_from_response, Bridge,
+    BridgeCapability, BridgeContext, BridgeError, ChatChunkStream, NativeMessages,
+    UpstreamErrorBody, UpstreamErrorView, UpstreamRelay, UpstreamWire,
     MAX_UPSTREAM_ERROR_BODY_BYTES, MAX_UPSTREAM_ERROR_MESSAGE_BYTES,
 };
 pub use chat::{
