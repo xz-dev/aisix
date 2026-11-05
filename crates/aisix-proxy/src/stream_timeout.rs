@@ -178,14 +178,14 @@ impl UploadProgress {
 /// "accepted by the upstream" closely.
 const UPLOAD_CHUNK: usize = 64 * 1024;
 
-/// The chunks of a [`ProgressBody`]; `Sync` because the transport needs it.
-pub(crate) type BodyChunks =
-    std::pin::Pin<Box<dyn Stream<Item = std::io::Result<Bytes>> + Send + Sync>>;
+/// The chunks of a [`ProgressBody`].
+pub(crate) type BodyChunks = std::pin::Pin<Box<dyn Stream<Item = std::io::Result<Bytes>> + Send>>;
 
 /// A request body of known length that records each chunk the transport
 /// takes. Its exact size hint keeps `Content-Length` framing.
 pub(crate) struct ProgressBody {
-    chunks: BodyChunks,
+    // The transport needs a `Sync` body; only `poll_frame` (`&mut`) uses it.
+    chunks: std::sync::Mutex<BodyChunks>,
     remaining: u64,
     progress: Arc<UploadProgress>,
 }
@@ -210,7 +210,7 @@ impl ProgressBody {
             sent: AtomicU64::new(0),
         });
         Self {
-            chunks,
+            chunks: std::sync::Mutex::new(chunks),
             remaining: len,
             progress,
         }
@@ -228,7 +228,8 @@ impl http_body::Body for ProgressBody {
         if self.remaining == 0 {
             return std::task::Poll::Ready(None);
         }
-        let item = std::task::ready!(self.chunks.poll_next_unpin(cx));
+        let chunks = self.chunks.get_mut().unwrap_or_else(|e| e.into_inner());
+        let item = std::task::ready!(chunks.poll_next_unpin(cx));
         let chunk = match item {
             Some(Ok(c)) => c,
             Some(Err(e)) => return std::task::Poll::Ready(Some(Err(e))),
