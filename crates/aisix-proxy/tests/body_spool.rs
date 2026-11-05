@@ -125,6 +125,16 @@ pub fn router(
     spool: Option<(BodySpoolConfig, &std::path::Path)>,
     retries: u32,
 ) -> axum::Router {
+    router_with(api_base, spool, retries, |_| {})
+}
+
+/// [`router`], with `extra` adding resources to the snapshot.
+pub fn router_with(
+    api_base: &str,
+    spool: Option<(BodySpoolConfig, &std::path::Path)>,
+    retries: u32,
+    extra: impl FnOnce(&AisixSnapshot),
+) -> axum::Router {
     let snap = AisixSnapshot::new();
     for (id, provider) in [("pk-openai", "openai"), ("pk-anthropic", "anthropic")] {
         let pk: ProviderKey = serde_json::from_value(json!({
@@ -155,6 +165,7 @@ pub fn router(
     }))
     .unwrap();
     snap.apikeys.insert(ResourceEntry::new("caller", key, 1));
+    extra(&snap);
     let hub = Arc::new(Hub::new());
     hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
     hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
@@ -468,4 +479,63 @@ async fn a_ticketed_large_body_is_leased_and_forwarded_with_its_ticket() {
     let (status, _) = send(&app, Body::from(body), &[cl, ticket]).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(seen.lock().unwrap()[1].ticket, None);
+}
+
+/// An OTLP collector that records every export body.
+async fn collector() -> (String, Arc<Mutex<Vec<String>>>) {
+    let got = Arc::new(Mutex::new(Vec::new()));
+    let app = axum::Router::new().fallback({
+        let got = got.clone();
+        move |body: String| {
+            got.lock().unwrap().push(body);
+            async { StatusCode::OK }
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}/v1/traces"), got)
+}
+
+/// B1: content capture, on success and on failure, gets the skeleton with
+/// every marker replaced by a placeholder that carries no nonce.
+#[tokio::test]
+async fn content_capture_never_sees_a_marker() {
+    let (endpoint, got) = collector().await;
+    let exporter: aisix_core::models::ObservabilityExporter = serde_json::from_value(json!({
+        "name": "capture", "enabled": true, "kind": "otlp_http", "endpoint": endpoint,
+        "content_mode": "full", "content_max_bytes": 1 << 20
+    }))
+    .unwrap();
+    let dir = private_dir();
+    let cg = no_limit_cgroup();
+    for fail in [0, 1] {
+        let (base, _) = upstream(fail).await;
+        let exporter = exporter.clone();
+        let app = router_with(&base, Some((spool_config(dir.path()), cg.path())), 0, |s| {
+            s.observability_exporters
+                .insert(ResourceEntry::new("exporter-1", exporter, 1));
+        });
+        let (status, v) = send(&app, Body::from(image_body("m", 3 * MIB, "hi")), &[]).await;
+        assert_eq!(status.is_success(), fail == 0, "{v}");
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let all = got.lock().unwrap().join("\n");
+        if all.matches("gen_ai.input.messages").count() >= 2 {
+            assert!(!all.contains("aisix-spool-"), "a marker reached capture");
+            assert_eq!(
+                all.matches("[spooled 31457").count(),
+                4,
+                "two blobs per request"
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no capture: {}",
+            all.replace("QUJD", "")
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }

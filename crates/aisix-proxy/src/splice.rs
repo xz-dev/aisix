@@ -124,6 +124,38 @@ impl BlobStore {
     }
 }
 
+/// `body` serialized for content capture and logs: every marker-shaped
+/// string becomes `[spooled <n> bytes]` (`[spooled]` when `store` does not
+/// resolve it), so no nonce reaches a log sink (D2).
+pub(crate) fn capture_json(body: &Value, store: Option<&BlobStore>) -> String {
+    let s = serde_json::to_string(body).unwrap_or_default();
+    if !s.contains(MARKER_PREFIX) {
+        return s;
+    }
+    let hex = |b: &[u8]| b.iter().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'));
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s.as_str();
+    while let Some(p) = rest.find(MARKER_PREFIX) {
+        out.push_str(&rest[..p]);
+        let marker = rest
+            .as_bytes()
+            .get(p..p + MARKER_LEN)
+            .filter(|m| hex(&m[12..44]) && m[44] == b'-' && hex(&m[45..]));
+        let Some(marker) = marker else {
+            out.push_str(MARKER_PREFIX);
+            rest = &rest[p + MARKER_PREFIX.len()..];
+            continue;
+        };
+        match store.and_then(|st| st.blob_of(marker)) {
+            Some(blob) => out.push_str(&format!("[spooled {} bytes]", blob.len)),
+            None => out.push_str("[spooled]"),
+        }
+        rest = &rest[p + MARKER_LEN..];
+    }
+    out.push_str(rest);
+    out
+}
+
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }

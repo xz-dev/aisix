@@ -273,3 +273,11 @@ fn mutated_bodies_keep_parity() {
         differential(&body);
     }
 }
+
+#[test]
+fn capture_redacts_every_marker_shape_and_nothing_else() {
+    let foreign = format!("aisix-spool-{}-{:08x}", "ab".repeat(16), 3);
+    let v = serde_json::json!({"a": "aisix-spool-short", "b": foreign, "c": "x"});
+    let out = crate::splice::capture_json(&v, None);
+    assert_eq!(out, r#"{"a":"aisix-spool-short","b":"[spooled]","c":"x"}"#);
+}
