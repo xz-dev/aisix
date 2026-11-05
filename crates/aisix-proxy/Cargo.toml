@@ -86,6 +86,9 @@ ipnet.workspace = true
 # off the uploaded file instead. Metadata-only (no decoding), and
 # default-features-off drops the id3v2 zlib path we never need.
 lofty.workspace = true
+# Body spool and capacity lease (body_spool.rs, capacity.rs): O_TMPFILE,
+# flock, fstat, fstatfs, fadvise. Already in the tree.
+rustix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
 # `test-util` drives the SSE-heartbeat tests on a paused clock.

@@ -194,15 +194,15 @@ pub async fn responses(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
-    // Result-wrapped so an extractor-layer 413 maps to the OpenAI
-    // envelope — see completions.rs.
-    body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
+    request: axum::extract::Request,
 ) -> Response {
     let started = Instant::now();
-    let Json(mut body) = match body {
-        Ok(json) => json,
+    // The spool (when on) keeps the lease, the memory charge and the blobs
+    // for the whole handler; they are released when it returns.
+    let (mut body, spooled) = match read_body(&state, request).await {
+        Ok(read) => read,
         // Answer through `reject` — see completions.rs.
-        Err(rej) => {
+        Err(err) => {
             return crate::reject::reject_before_dispatch(
                 &state,
                 "POST",
@@ -211,7 +211,7 @@ pub async fn responses(
                 Some(&auth.entry.id),
                 started,
                 crate::reject::Envelope::OpenAi,
-                crate::error::proxy_error_from_json_rejection(rej, state.request_body_limit_bytes),
+                err,
             );
         }
     };
@@ -256,6 +256,7 @@ pub async fn responses(
         &snapshot,
         &auth,
         &mut body,
+        spooled.as_ref(),
         &affinity,
         &request_id,
         started,
@@ -578,6 +579,27 @@ pub async fn responses(
     }
 }
 
+/// The request body: through the spool when `body_spool` is on, else
+/// buffered and parsed as before (same rejections either way).
+async fn read_body(
+    state: &ProxyState,
+    request: axum::extract::Request,
+) -> Result<(Value, Option<crate::spooled_json::Spooled>), ProxyError> {
+    let limit = state.request_body_limit_bytes;
+    match &state.body_spool {
+        Some(cfg) => crate::spooled_json::read(cfg, request, limit)
+            .await
+            .map(|(v, s)| (v, Some(s))),
+        None => {
+            use axum::extract::FromRequest;
+            match Json::<Value>::from_request(request, state).await {
+                Ok(Json(v)) => Ok((v, None)),
+                Err(rej) => Err(crate::error::proxy_error_from_json_rejection(rej, limit)),
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn dispatch(
     state: &ProxyState,
@@ -586,6 +608,8 @@ async fn dispatch(
     // `&mut` so mask-action PII guardrails (#932) can rewrite the request
     // text in place before it reaches the upstream.
     body: &mut Value,
+    // The spooled request (blobs, lease, charge), when `body_spool` is on.
+    spooled: Option<&crate::spooled_json::Spooled>,
     // The context tags `responses` removed from `body`.
     affinity: &crate::responses_affinity::ContextAffinity,
     request_id: &str,
@@ -649,6 +673,11 @@ async fn dispatch(
     let resolved_chain = Arc::new(state.guardrail_index.resolve(&guardrail_ctx));
     *audit_out = resolved_chain.audit_log();
     if !resolved_chain.is_empty() {
+        // A guardrail chain reads the whole request: a fallback path.
+        if let Some(sp) = spooled {
+            sp.rehydrate_for("guardrail chains", body)
+                .map_err(ProxyError::Capacity)?;
+        }
         let chat = responses_input_to_chat(&model_name, body);
         let (verdict, hits) = aisix_guardrails::Guardrail::check_input_non_segment_observed(
             resolved_chain.as_ref(),
@@ -877,56 +906,78 @@ async fn dispatch(
             };
             let attempt_body = stripped_body.as_ref().unwrap_or(body);
             let mark = affinity.response_mark(is_routing_request.then_some(target.id.as_str()));
-            let result = if crate::dispatch::serves_natively(
+            let native = crate::dispatch::serves_natively(
                 snapshot,
                 &target.model,
                 aisix_core::ApiSurface::Responses,
-            ) {
-                responses_to_target(
-                    state,
-                    snapshot,
-                    attempt_body,
-                    mark,
-                    &target.model,
-                    &target.id,
-                    timeouts,
-                    request_id,
-                    resolved_chain.clone(),
-                    started,
-                    attempt_started,
-                    &model_name,
-                    &auth.entry.id,
-                    client,
-                    attempt,
-                    &mut reservation,
-                    &mut member_reservation,
-                    redactions_out.clone(),
-                    monitor_hits_out.clone(),
-                )
-                .await
-            } else {
-                responses_cross_provider_to_target(
-                    state,
-                    snapshot,
-                    attempt_body,
-                    mark,
-                    &target.model,
-                    &target.id,
-                    timeouts,
-                    request_id,
-                    resolved_chain.clone(),
-                    started,
-                    attempt_started,
-                    &model_name,
-                    &auth.entry.id,
-                    client,
-                    attempt,
-                    &mut reservation,
-                    &mut member_reservation,
-                    redactions_out.clone(),
-                    monitor_hits_out.clone(),
-                )
-                .await
+            );
+            // Spooled body: the route's ceiling first; a bridged target is a
+            // fallback path and gets the whole body back.
+            let prepared = match spooled {
+                None => Ok(None),
+                Some(sp) => sp
+                    .check_ceiling(&target.id)
+                    .and_then(|()| {
+                        if native || sp.store.as_ref().is_none_or(|s| s.blobs.is_empty()) {
+                            return Ok(None);
+                        }
+                        let mut full = attempt_body.clone();
+                        let path = format!("bridged target {}", target.model.display_name);
+                        sp.rehydrate_for(&path, &mut full).map(|()| Some(full))
+                    })
+                    .map_err(ProxyError::Capacity),
+            };
+            let result = match prepared {
+                Err(e) => Err(e),
+                Ok(_) if native => {
+                    responses_to_target(
+                        state,
+                        snapshot,
+                        attempt_body,
+                        spooled,
+                        mark,
+                        &target.model,
+                        &target.id,
+                        timeouts,
+                        request_id,
+                        resolved_chain.clone(),
+                        started,
+                        attempt_started,
+                        &model_name,
+                        &auth.entry.id,
+                        client,
+                        attempt,
+                        &mut reservation,
+                        &mut member_reservation,
+                        redactions_out.clone(),
+                        monitor_hits_out.clone(),
+                    )
+                    .await
+                }
+                Ok(full) => {
+                    responses_cross_provider_to_target(
+                        state,
+                        snapshot,
+                        full.as_ref().unwrap_or(attempt_body),
+                        mark,
+                        &target.model,
+                        &target.id,
+                        timeouts,
+                        request_id,
+                        resolved_chain.clone(),
+                        started,
+                        attempt_started,
+                        &model_name,
+                        &auth.entry.id,
+                        client,
+                        attempt,
+                        &mut reservation,
+                        &mut member_reservation,
+                        redactions_out.clone(),
+                        monitor_hits_out.clone(),
+                    )
+                    .await
+                }
             };
             match result {
                 Ok(mut success) => {
@@ -1222,6 +1273,8 @@ async fn responses_to_target(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
     body: &Value,
+    // The spooled request: its blobs are spliced into the outbound body.
+    spooled: Option<&crate::spooled_json::Spooled>,
     // The context tags this attempt's response carries back.
     mark: crate::responses_affinity::ResponseMark,
     model: &aisix_core::Model,
@@ -1396,6 +1449,19 @@ async fn responses_to_target(
         ),
     );
 
+    // The capacity ticket goes only to the configured internal upstreams.
+    if let Some(sp) = spooled {
+        let host = match &url {
+            aisix_gateway::url_cache::EndpointUrl::Parsed(u) => u.host_str(),
+            aisix_gateway::url_cache::EndpointUrl::Unparsed(_) => None,
+        };
+        if let Some(id) = sp
+            .ticket_for(host)
+            .and_then(|id| HeaderValue::from_str(id).ok())
+        {
+            headers.insert(HeaderName::from_static(crate::capacity::TICKET_HEADER), id);
+        }
+    }
     let client = crate::http_client::client_for(pk_entry.value.upstream_connection().as_ref());
     let mut req = url.post_on(&client).headers(headers);
     // #554: non-streaming gets the E2E request timeout via reqwest's
@@ -1420,8 +1486,19 @@ async fn responses_to_target(
     // before it is bounded by the same value per gap with no progress (D8),
     // so a slow upstream that keeps reading is not cut at the deadline.
     // Non-streaming relies on the request-level timeout set above.
-    let sent = match timeouts.stream.filter(|_| is_stream) {
-        Some(d) => {
+    // A spooled body is always streamed: its blobs are spliced in from the
+    // spool (D2), and the serialized skeleton must never go out as is.
+    let store = spooled.and_then(|sp| sp.store.clone());
+    let stream_deadline = timeouts.stream.filter(|_| is_stream);
+    let sent = match (store, stream_deadline) {
+        (Some(store), d) => {
+            let body = store
+                .plan(body_bytes.clone())
+                .map_err(ProxyError::Capacity)?
+                .body(store);
+            crate::stream_timeout::send_with_upload_deadline(req, body, d, send_started).await
+        }
+        (None, Some(d)) => {
             crate::stream_timeout::send_with_upload_deadline(
                 req,
                 crate::stream_timeout::ProgressBody::from_bytes(body_bytes.clone()),
@@ -1430,7 +1507,7 @@ async fn responses_to_target(
             )
             .await
         }
-        None => {
+        (None, None) => {
             crate::stream_timeout::send_with_deadline(
                 req.body(body_bytes.clone()),
                 None,

@@ -539,6 +539,7 @@ pub(crate) fn gateway_error_message(err: &ProxyError) -> String {
         | ProxyError::BudgetExceeded(_)
         | ProxyError::BudgetUnverified
         | ProxyError::RequestTooLarge { .. }
+        | ProxyError::Capacity(_)
         | ProxyError::RateLimit(_)
         | ProxyError::PolicyRateLimit { .. } => true,
         // `InvalidRequest` can quote the request body (a serde message
@@ -600,6 +601,7 @@ pub(crate) fn attempt_reached_upstream(err: &ProxyError) -> bool {
         | ProxyError::BudgetExceeded(_)
         | ProxyError::BudgetUnverified
         | ProxyError::RequestTooLarge { .. }
+        | ProxyError::Capacity(_)
         | ProxyError::RateLimit(_)
         | ProxyError::PolicyRateLimit { .. } => false,
     }

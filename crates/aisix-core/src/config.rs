@@ -110,6 +110,11 @@ pub struct Config {
     /// config-rs via the `AISIX_` prefix.
     #[serde(default)]
     pub bedrock_endpoint_url: Option<String>,
+    /// Large `/v1/responses` bodies: skeleton + blob spool, capacity
+    /// tickets and per-route request ceilings — see [`BodySpoolConfig`].
+    /// Off by default.
+    #[serde(default)]
+    pub body_spool: BodySpoolConfig,
     /// Keys the loaded file or environment carried that name no setting:
     /// the dotted path, and the `AISIX_*` variable that set it, if one did.
     /// See [`Config::ignored_keys`].
@@ -2117,6 +2122,39 @@ impl Default for ShutdownConfig {
     }
 }
 
+/// Large-request handling on `/v1/responses` (skeleton + blob spool).
+///
+/// With `threshold_bytes > 0`, every `/v1/responses` body is read as a
+/// stream: media and file strings (`image_url`, `file_data`, `source.data`,
+/// any `data:` URL) of at least `threshold_bytes` go to an anonymous file
+/// in `dir`, the rest stays in memory as a skeleton that the handler parses,
+/// and each attempt streams the skeleton with the blobs spliced back in.
+/// The skeleton is limited to 16 MiB (8 MiB for a ticketed body), and
+/// every request is charged against the cgroup's memory headroom.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(default)]
+pub struct BodySpoolConfig {
+    /// Smallest string that is spooled. `0` (the default) turns the whole
+    /// feature off: bodies are buffered and parsed as before.
+    pub threshold_bytes: u64,
+    /// Spool directory: disk-backed (not tmpfs or ramfs), mode 0700, empty
+    /// of regular files, and supporting `O_TMPFILE`. Required when on.
+    pub dir: Option<String>,
+    /// Read-only capacity ledger. A body of 64 MiB or more needs a ticket
+    /// from it; unset refuses every such body.
+    pub ledger_dir: Option<String>,
+    /// Upstream hosts the capacity ticket header is forwarded to. Empty
+    /// (the default) forwards it nowhere.
+    pub ticket_upstream_hosts: Vec<String>,
+    /// Free bytes a spool write must leave on its filesystem. `0` means
+    /// the 1 GiB default.
+    pub disk_reserve_bytes: u64,
+    /// Request ceiling in bytes per model resource id, applied as
+    /// `min(request_body_limit_bytes, ceiling)` before a target is sent.
+    pub route_ceilings: std::collections::BTreeMap<String, u64>,
+}
+
 /// Every top-level setting of [`Config`], spelled as the environment
 /// source sees it — `AISIX_` stripped and lowercased.
 ///
@@ -2125,9 +2163,10 @@ impl Default for ShutdownConfig {
 /// injects such variables, rather than reported as an ignored key.
 /// `config_top_level_keys_match_the_struct` fails the build when a field
 /// is added or renamed without this list following.
-const TOP_LEVEL_ENV_KEYS: [&str; 13] = [
+const TOP_LEVEL_ENV_KEYS: [&str; 14] = [
     "admin",
     "bedrock_endpoint_url",
+    "body_spool",
     "cache",
     "downstream",
     "etcd",
@@ -2261,6 +2300,7 @@ const ENV_LIST_PARSE_KEYS: &[&str] = &[
     "ratelimit.redis.nodes",
     "ratelimit.redis.sentinels",
     "outbound.ssrf_protection.allowed_hosts",
+    "body_spool.ticket_upstream_hosts",
 ];
 
 /// The `AISIX_*` variable among `names` that set `key` or a value
@@ -5346,6 +5386,7 @@ observability:
             "downstream": {},
             "shutdown": {},
             "managed": {},
+            "body_spool": {},
         }))
         .expect("defaults must deserialize");
         let expected = serde_json::to_value(&cfg).unwrap();

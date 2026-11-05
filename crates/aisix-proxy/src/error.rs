@@ -86,6 +86,12 @@ pub struct ErrorBody {
     /// additive convention as `budget`: absent everywhere else.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy: Option<PolicyErrorRef>,
+    /// The hop that refused a large request (capacity refusals only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hop: Option<String>,
+    /// The limit or required bytes of a capacity refusal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit_bytes: Option<u64>,
 }
 
 /// The `error.policy` block on a policy-layer 429.
@@ -126,6 +132,8 @@ impl ErrorEnvelope {
                 code: None,
                 budget: None,
                 policy: None,
+                hop: None,
+                limit_bytes: None,
             },
         }
     }
@@ -349,6 +357,11 @@ pub enum ProxyError {
     /// when the inbound `Content-Length` exceeds the configured cap.
     #[error("request body exceeds {limit_bytes}-byte limit")]
     RequestTooLarge { limit_bytes: usize },
+    /// A large-request capacity refusal (inline-bytes, fallback or route
+    /// limit, memory charge, disk floor, capacity ticket): its own status,
+    /// `error.code`, limit and hop.
+    #[error("{0}")]
+    Capacity(crate::capacity::CapacityError),
     #[error(transparent)]
     RateLimit(#[from] RateLimitError),
     /// A policy-layer rate-limit rejection carrying the offending
@@ -494,6 +507,9 @@ impl ProxyError {
             ProxyError::BudgetExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
             ProxyError::BudgetUnverified => StatusCode::SERVICE_UNAVAILABLE,
             ProxyError::RequestTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+            ProxyError::Capacity(c) => {
+                StatusCode::from_u16(c.status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE)
+            }
             ProxyError::RateLimit(_) => StatusCode::TOO_MANY_REQUESTS,
             ProxyError::PolicyRateLimit { .. } => StatusCode::TOO_MANY_REQUESTS,
             ProxyError::Bridge(b) => {
@@ -533,6 +549,8 @@ impl ProxyError {
             ProxyError::InvalidRequest(_) => "invalid_request_error",
             ProxyError::WebSocketUpgradeRequired { .. } => "websocket_upgrade_required",
             ProxyError::RequestTooLarge { .. } => "invalid_request_error",
+            ProxyError::Capacity(c) if c.status == 413 => "invalid_request_error",
+            ProxyError::Capacity(_) => "api_error",
             ProxyError::ProviderUnavailable => "provider_unavailable",
             // A gateway-side dependency failed, like `JwksUnavailable`;
             // `error.code` carries the distinction.
@@ -648,6 +666,12 @@ impl ProxyError {
         match self {
             ProxyError::BudgetExceeded(r) => env.with_code("budget_exceeded").with_budget(r),
             ProxyError::BudgetUnverified => env.with_code("budget_unverified"),
+            ProxyError::Capacity(c) => {
+                let mut env = env.with_code(c.code);
+                env.error.hop = Some(crate::capacity::HOP.to_string());
+                env.error.limit_bytes = c.limit_bytes;
+                env
+            }
             // Attribution for policy-layer 429s (AISIX-Cloud#892): the
             // OpenAI envelope names the offending policy. The Anthropic
             // envelope keeps its strict {type,message} shape.

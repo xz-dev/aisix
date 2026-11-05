@@ -93,6 +93,8 @@ pub(crate) fn render_openai_envelope(
         },
         budget: None,
         policy: None,
+        hop: None,
+        limit_bytes: None,
     }
 }
 
@@ -108,6 +110,8 @@ fn generic(message: &str) -> ErrorBody {
         code: None,
         budget: None,
         policy: None,
+        hop: None,
+        limit_bytes: None,
     }
 }
 

@@ -354,6 +354,9 @@ pub struct ProxyStateInner {
     /// to when neither the target Model nor its model group sets one. See
     /// `routing::effective_timeouts`.
     pub default_timeouts: crate::routing::TimeoutDefaults,
+    /// `body_spool`: large `/v1/responses` bodies through the skeleton +
+    /// blob spool. `None` = off, bodies are buffered as before.
+    pub body_spool: Option<Arc<crate::spooled_json::BodySpool>>,
 }
 
 impl std::ops::Deref for ProxyState {
@@ -459,6 +462,7 @@ impl ProxyState {
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
             default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
             default_timeouts: crate::routing::TimeoutDefaults::default(),
+            body_spool: None,
         })
     }
 
@@ -512,6 +516,7 @@ impl ProxyState {
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
             default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
             default_timeouts: crate::routing::TimeoutDefaults::default(),
+            body_spool: None,
         })
     }
 
@@ -579,6 +584,7 @@ impl ProxyState {
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
             default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
             default_timeouts: crate::routing::TimeoutDefaults::default(),
+            body_spool: None,
         })
     }
 
@@ -627,6 +633,12 @@ impl ProxyState {
             stream: (stream_timeout_ms > 0)
                 .then(|| std::time::Duration::from_millis(stream_timeout_ms)),
         };
+        self
+    }
+
+    /// Turn on the `/v1/responses` body spool (`body_spool`).
+    pub fn with_body_spool(mut self, spool: Option<crate::spooled_json::BodySpool>) -> Self {
+        Arc::make_mut(&mut self.inner).body_spool = spool.map(Arc::new);
         self
     }
 

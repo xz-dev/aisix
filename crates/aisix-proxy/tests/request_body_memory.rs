@@ -337,6 +337,22 @@ fn snapshot(api_base: &str, capture_content: bool) -> AisixSnapshot {
 }
 
 fn router(api_base: &str, capture_content: bool) -> Router {
+    spooled_router(api_base, capture_content, None)
+}
+
+/// [`router`] with the `/v1/responses` body spool on, spooling strings of
+/// at least 1 MiB into `dir`.
+fn spooled_router(api_base: &str, capture_content: bool, dir: Option<&std::path::Path>) -> Router {
+    let spool = dir.map(|dir| {
+        let cfg = aisix_core::config::BodySpoolConfig {
+            threshold_bytes: 1 << 20,
+            dir: Some(dir.display().to_string()),
+            ..Default::default()
+        };
+        aisix_proxy::spooled_json::BodySpool::from_config(&cfg)
+            .unwrap()
+            .unwrap()
+    });
     let hub = Arc::new(Hub::new());
     hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
     hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
@@ -358,7 +374,8 @@ fn router(api_base: &str, capture_content: bool) -> Router {
             hub,
             &cfg,
         )
-        .without_cache(),
+        .without_cache()
+        .with_body_spool(spool),
     )
 }
 
@@ -865,6 +882,55 @@ async fn request_body_is_held_at_most_twice_while_upstream_is_pending() {
         }
     }
     assert!(stream_failures.is_empty(), "{}", stream_failures.join("; "));
+
+    // large-request-capacity 6.2: a 64 MiB single-string body through the
+    // spool (4 KiB short of the 64 MiB ticket threshold, so no ticket). The handler holds at most 0.05x of it while the upstream is
+    // pending, and allocates at most 0.1x (plus fixed overhead) on top of
+    // the request body it was handed.
+    let spool_dir = tempfile::tempdir_in("/tmp").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(spool_dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let spooled_app = spooled_router(&upstream.base, true, Some(spool_dir.path()));
+    // Exact capacity: serializing the large string leaves the `String`
+    // with about twice its length allocated, which the peak (counted from
+    // the finished body) would otherwise charge to the gateway.
+    let single = |len: usize| {
+        let mut body = responses_body((1, len));
+        body.shrink_to_fit();
+        body
+    };
+    held_while_pending(&spooled_app, &mut upstream, "/v1/responses", (0, 1), || {
+        single(1000)
+    })
+    .await;
+    let (s_held, s_peak, s_len) =
+        held_while_pending(&spooled_app, &mut upstream, "/v1/responses", (0, 1), || {
+            single(1000)
+        })
+        .await;
+    let (l_held, l_peak, l_len) =
+        held_while_pending(&spooled_app, &mut upstream, "/v1/responses", (0, 1), || {
+            single((64 << 20) - 4096)
+        })
+        .await;
+    let n = l_len as f64;
+    let held = (l_held - s_held) as f64 / n;
+    // The peak counts from the finished request body: take it out.
+    let peak_over_body = ((l_peak - l_len as isize) - (s_peak - s_len as isize)) as f64;
+    const FIXED: f64 = 4.0 * 1024.0 * 1024.0;
+    eprintln!(
+        "responses spooled 64 MiB: held {held:.4}x (limit 0.05x), peak over the body {:.4}x + fixed (limit 0.1x + 4 MiB)",
+        peak_over_body / n
+    );
+    assert!(held <= 0.05, "spooled body held {held:.4}x");
+    assert!(
+        peak_over_body <= 0.1 * n + FIXED,
+        "spooled body peaked {:.4}x over the body",
+        peak_over_body / n
+    );
+    assert_eq!(std::fs::read_dir(spool_dir.path()).unwrap().count(), 0);
     for (family, m, peak) in report {
         assert!(
             m <= family.limit(),

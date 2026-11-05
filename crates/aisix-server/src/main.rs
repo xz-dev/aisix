@@ -1272,6 +1272,11 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     proxy_state = proxy_state.with_default_retries(cfg.upstream.retries);
     proxy_state =
         proxy_state.with_default_timeouts(cfg.upstream.timeout_ms, cfg.upstream.stream_timeout_ms);
+    // Large-request spool: an unusable spool dir (tmpfs, wrong mode, a
+    // leftover file, no O_TMPFILE) is boot-fatal and named.
+    let body_spool = aisix_proxy::spooled_json::BodySpool::from_config(&cfg.body_spool)
+        .map_err(|e| anyhow::anyhow!("body_spool: {e}"))?;
+    proxy_state = proxy_state.with_body_spool(body_spool);
     // Live guardrail index: resolves per-request chains from
     // attachment scope + priority, rebuilding lazily whenever the
     // etcd watch supervisor stores a fresh snapshot. Dashboard

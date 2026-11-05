@@ -7,6 +7,14 @@
       "tls": null
     },
     "bedrock_endpoint_url": null,
+    "body_spool": {
+      "dir": null,
+      "disk_reserve_bytes": 0,
+      "ledger_dir": null,
+      "route_ceilings": {},
+      "threshold_bytes": 0,
+      "ticket_upstream_hosts": []
+    },
     "cache": {
       "backend": "memory",
       "redis": null

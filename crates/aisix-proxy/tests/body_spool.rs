@@ -1,0 +1,471 @@
+//! large-request-capacity task 6.2 through the real router: the spooled
+//! `/v1/responses` path sends the upstream the bytes the buffered path
+//! sends, and refuses explicitly where the spec says it must.
+
+use std::os::unix::fs::PermissionsExt;
+use std::sync::{Arc, Mutex};
+
+use aisix_core::config::BodySpoolConfig;
+use aisix_core::resource::ResourceEntry;
+use aisix_core::snapshot::SnapshotHandle;
+use aisix_core::{AisixSnapshot, ApiKey, Model, ProviderKey, ProxyConfig};
+use aisix_gateway::Hub;
+use aisix_provider_anthropic::AnthropicBridge;
+use aisix_provider_openai::OpenAiBridge;
+use aisix_proxy::spooled_json::BodySpool;
+use aisix_proxy::{build_router, ProxyState};
+use axum::body::{to_bytes, Body};
+use axum::http::{Request, StatusCode};
+use futures::StreamExt;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use tower::ServiceExt;
+
+const MIB: usize = 1 << 20;
+pub const TICKET: &str = "0123456789abcdef0123456789abcdef";
+
+/// What the upstream saw of one request.
+#[derive(Clone, Debug)]
+pub struct Seen {
+    pub path: String,
+    pub len: usize,
+    pub content_length: Option<String>,
+    pub ticket: Option<String>,
+    pub sha: Vec<u8>,
+    /// The body, when under 8 MiB.
+    pub body: Option<Vec<u8>>,
+}
+
+/// An upstream that records each request and answers it; the first
+/// `fail_first` calls get a 500.
+pub async fn upstream(fail_first: usize) -> (String, Arc<Mutex<Vec<Seen>>>) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let fails = Arc::new(std::sync::atomic::AtomicUsize::new(fail_first));
+    let app = axum::Router::new().fallback({
+        let seen = seen.clone();
+        move |req: Request<Body>| {
+            let seen = seen.clone();
+            let fails = fails.clone();
+            async move {
+                let path = req.uri().path().to_string();
+                let (content_length, ticket) = {
+                    let header = |n: &str| {
+                        req.headers()
+                            .get(n)
+                            .map(|v| v.to_str().unwrap().to_string())
+                    };
+                    (header("content-length"), header("x-ai-gateway-capacity-ticket"))
+                };
+                let mut body = req.into_body().into_data_stream();
+                let (mut sha, mut len, mut kept) = (Sha256::new(), 0, Vec::new());
+                while let Some(c) = body.next().await {
+                    let c = c.unwrap();
+                    sha.update(&c);
+                    len += c.len();
+                    if len < 8 * MIB {
+                        kept.extend_from_slice(&c);
+                    }
+                }
+                seen.lock().unwrap().push(Seen {
+                    path: path.clone(),
+                    len,
+                    content_length,
+                    ticket,
+                    sha: sha.finalize().to_vec(),
+                    body: (len < 8 * MIB).then_some(kept),
+                });
+                use axum::response::IntoResponse;
+                if fails
+                    .fetch_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |n| n.checked_sub(1))
+                    .is_ok()
+                {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response();
+                }
+                if path.ends_with("/messages") {
+                    return axum::Json(json!({
+                        "id": "msg_1", "type": "message", "role": "assistant",
+                        "model": "claude-sonnet-4-5", "content": [{"type": "text", "text": "ok"}],
+                        "stop_reason": "end_turn", "usage": {"input_tokens": 2, "output_tokens": 1}
+                    }))
+                    .into_response();
+                }
+                axum::Json(json!({
+                    "id": "resp_1", "object": "response", "status": "completed", "model": "gpt-4o",
+                    "output": [], "usage": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3}
+                }))
+                .into_response()
+            }
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), seen)
+}
+
+pub fn private_dir() -> tempfile::TempDir {
+    let d = tempfile::tempdir_in("/tmp").unwrap();
+    std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    d
+}
+
+pub fn spool_config(dir: &std::path::Path) -> BodySpoolConfig {
+    BodySpoolConfig {
+        threshold_bytes: 64 * 1024,
+        dir: Some(dir.display().to_string()),
+        ..Default::default()
+    }
+}
+
+/// A router on `api_base` with an openai model `m` (native) and an
+/// anthropic model `c` (bridged). `spool` turns the body spool on, with
+/// the memory charge reading `cgroup`.
+pub fn router(
+    api_base: &str,
+    spool: Option<(BodySpoolConfig, &std::path::Path)>,
+    retries: u32,
+) -> axum::Router {
+    let snap = AisixSnapshot::new();
+    for (id, provider) in [("pk-openai", "openai"), ("pk-anthropic", "anthropic")] {
+        let pk: ProviderKey = serde_json::from_value(json!({
+            "display_name": id, "secret": "sk-upstream", "api_base": api_base,
+            "provider": provider, "adapter": provider
+        }))
+        .unwrap();
+        snap.provider_keys.insert(ResourceEntry::new(id, pk, 1));
+    }
+    for (id, name, provider, upstream, pk) in [
+        ("model-m", "m", "openai", "gpt-4o", "pk-openai"),
+        (
+            "model-c",
+            "c",
+            "anthropic",
+            "claude-sonnet-4-5",
+            "pk-anthropic",
+        ),
+    ] {
+        let model: Model = serde_json::from_value(json!({
+            "display_name": name, "provider": provider, "model_name": upstream, "provider_key_id": pk
+        }))
+        .unwrap();
+        snap.models.insert(ResourceEntry::new(id, model, 1));
+    }
+    let key: ApiKey = serde_json::from_value(json!({
+        "key_hash": ApiKey::hash_bearer("sk-caller"), "allowed_models": ["m", "c"]
+    }))
+    .unwrap();
+    snap.apikeys.insert(ResourceEntry::new("caller", key, 1));
+    let hub = Arc::new(Hub::new());
+    hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+    hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+    let cfg = ProxyConfig {
+        addr: "127.0.0.1:0".into(),
+        request_body_limit_bytes: 256 * MIB,
+        real_ip: Default::default(),
+        request_id: Default::default(),
+        url_rewrites: Vec::new(),
+        expose_debug_headers: false,
+        tls: None,
+        listeners: Vec::new(),
+        thread_per_core: None,
+        workers: None,
+    };
+    let spool = spool.map(|(c, cgroup)| {
+        BodySpool::from_config(&c)
+            .unwrap()
+            .expect("spool on")
+            .with_cgroup_dir(cgroup)
+    });
+    build_router(
+        ProxyState::new(SnapshotHandle::new(snap), hub, &cfg)
+            .without_cache()
+            .with_default_retries(retries)
+            .with_body_spool(spool),
+    )
+}
+
+pub async fn send(
+    app: &axum::Router,
+    body: Body,
+    headers: &[(&str, String)],
+) -> (StatusCode, Value) {
+    let mut req = Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header("authorization", "Bearer sk-caller")
+        .header("content-type", "application/json");
+    for (k, v) in headers {
+        req = req.header(*k, v);
+    }
+    let resp = app.clone().oneshot(req.body(body).unwrap()).await.unwrap();
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), 16 * MIB).await.unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+pub fn image_body(model: &str, image_bytes: usize, text: &str) -> String {
+    let image = "QUJD".repeat(image_bytes / 4);
+    json!({
+        "model": model,
+        "input": [{"role": "user", "content": [
+            {"type": "input_text", "text": text},
+            {"type": "input_image", "image_url": format!("data:image/png;base64,{image}")},
+            {"type": "input_file", "file_data": format!("{image}\u{1}\"\\é😀")}
+        ]}],
+        "metadata": {"big": "BIGINT", "e": "EXP"}
+    })
+    .to_string()
+    .replace("\"BIGINT\"", "123456789012345678901234567890")
+    .replace("\"EXP\"", "1e3")
+}
+
+fn no_limit_cgroup() -> tempfile::TempDir {
+    tempfile::tempdir().unwrap()
+}
+
+fn cgroup_with_headroom(headroom: u64) -> tempfile::TempDir {
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(d.path().join("memory.max"), (1u64 << 30).to_string()).unwrap();
+    std::fs::write(
+        d.path().join("memory.current"),
+        ((1u64 << 30) - headroom).to_string(),
+    )
+    .unwrap();
+    d
+}
+
+/// Differential: the buffered and the spooled path send identical bytes
+/// and `Content-Length`, and every retry re-reads the spool.
+#[tokio::test]
+async fn spooled_path_sends_the_buffered_bytes_on_every_attempt() {
+    let body = image_body(
+        "m",
+        3 * MIB,
+        "text \" esc \\ \u{7} é 😀 data:not-media-at-text-key",
+    );
+    let (base, seen) = upstream(0).await;
+    let (status, _) = send(&router(&base, None, 0), Body::from(body.clone()), &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    let dir = private_dir();
+    let cg = no_limit_cgroup();
+    let (base2, seen2) = upstream(1).await;
+    let app = router(&base2, Some((spool_config(dir.path()), cg.path())), 1);
+    let (status, v) = send(&app, Body::from(body), &[]).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let legacy = seen.lock().unwrap()[0].clone();
+    let attempts = seen2.lock().unwrap().clone();
+    assert_eq!(attempts.len(), 2, "the 500 is retried");
+    for a in &attempts {
+        assert_eq!(a.content_length, legacy.content_length);
+        assert_eq!(a.len, legacy.len);
+        assert!(
+            a.sha == legacy.sha,
+            "spliced body differs from the buffered one"
+        );
+        assert!(a.ticket.is_none());
+    }
+    assert_eq!(
+        std::fs::read_dir(dir.path()).unwrap().count(),
+        0,
+        "no spool file left"
+    );
+}
+
+#[tokio::test]
+async fn text_above_the_inline_limit_gets_a_named_413() {
+    let dir = private_dir();
+    let cg = no_limit_cgroup();
+    let (base, seen) = upstream(0).await;
+    let app = router(&base, Some((spool_config(dir.path()), cg.path())), 0);
+    let text = "t".repeat(17 * MIB);
+    let body = json!({"model": "m", "input": text}).to_string();
+    let (status, v) = send(&app, Body::from(body), &[]).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{v}");
+    assert_eq!(v["error"]["code"], "request_too_large");
+    assert_eq!(v["error"]["limit_bytes"], 16 * MIB);
+    assert_eq!(v["error"]["hop"], "aisix");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("inline-bytes limit"),
+        "{v}"
+    );
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn bridged_target_is_a_fallback_path() {
+    let dir = private_dir();
+    let cg = no_limit_cgroup();
+    let (base, seen) = upstream(0).await;
+    let app = router(&base, Some((spool_config(dir.path()), cg.path())), 0);
+    let (status, v) = send(&app, Body::from(image_body("c", 9 * MIB, "hi")), &[]).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{v}");
+    assert_eq!(v["error"]["limit_bytes"], 16 * MIB);
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("fallback limit of bridged target c"),
+        "{v}"
+    );
+    assert!(seen.lock().unwrap().is_empty());
+    // Under the limit the bridged target gets the whole request back.
+    let image = format!("data:image/png;base64,{}", "QUJD".repeat(50_000));
+    let small = json!({"model": "c", "max_output_tokens": 16, "input": [{"role": "user", "content": [
+        {"type": "input_image", "image_url": image}]}]});
+    let (status, v) = send(&app, Body::from(small.to_string()), &[]).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let sent = seen.lock().unwrap()[0].body.clone().unwrap();
+    let sent = String::from_utf8_lossy(&sent);
+    assert!(!sent.contains("aisix-spool-"), "no marker leaves the hop");
+    assert!(
+        sent.contains(&"QUJD".repeat(50_000)),
+        "the image is back in the bridged body"
+    );
+}
+
+#[tokio::test]
+async fn route_ceiling_and_memory_charge_refuse_explicitly() {
+    let dir = private_dir();
+    let cg = no_limit_cgroup();
+    let (base, seen) = upstream(0).await;
+    let mut cfg = spool_config(dir.path());
+    cfg.route_ceilings.insert("model-m".into(), 1_000_000);
+    let app = router(&base, Some((cfg, cg.path())), 0);
+    let (status, v) = send(&app, Body::from(image_body("m", 2 * MIB, "hi")), &[]).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{v}");
+    assert_eq!(v["error"]["limit_bytes"], 1_000_000);
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("route model-m"),
+        "{v}"
+    );
+
+    let tight = cgroup_with_headroom(36 << 20);
+    let app = router(&base, Some((spool_config(dir.path()), tight.path())), 0);
+    let (status, v) = send(&app, Body::from(image_body("m", 2 * MIB, "hi")), &[]).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+    assert_eq!(v["error"]["code"], "insufficient_memory");
+    assert_eq!(v["error"]["hop"], "aisix");
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+fn big_image_body() -> String {
+    json!({"model": "m", "stream": false, "input": [{"role": "user", "content": [
+        {"type": "input_image", "image_url": format!("data:image/png;base64,{}", "A".repeat(65 * MIB))}
+    ]}]})
+    .to_string()
+}
+
+/// The same bytes, as a chunked body with no `Content-Length`.
+fn chunked(body: String) -> Body {
+    let bytes = bytes::Bytes::from(body);
+    let chunks: Vec<_> = (0..bytes.len())
+        .step_by(MIB)
+        .map(|i| Ok::<_, std::io::Error>(bytes.slice(i..(i + MIB).min(bytes.len()))))
+        .collect();
+    Body::from_stream(futures::stream::iter(chunks))
+}
+
+#[tokio::test]
+async fn a_large_body_without_a_ticket_or_ledger_is_refused() {
+    let dir = private_dir();
+    let cg = no_limit_cgroup();
+    let (base, seen) = upstream(0).await;
+    let app = router(&base, Some((spool_config(dir.path()), cg.path())), 0);
+    let body = big_image_body();
+    let cl = ("content-length", body.len().to_string());
+    for (b, headers) in [
+        (Body::from(body.clone()), vec![cl.clone()]),
+        (chunked(body.clone()), vec![]),
+        (
+            Body::from(body.clone()),
+            vec![
+                cl.clone(),
+                ("x-ai-gateway-capacity-ticket", TICKET.to_string()),
+            ],
+        ),
+    ] {
+        let (status, v) = send(&app, b, &headers).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+        assert_eq!(v["error"]["code"], "capacity_ticket_missing");
+        assert_eq!(v["error"]["hop"], "aisix");
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("no capacity ledger"),
+            "{v}"
+        );
+    }
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_ticketed_large_body_is_leased_and_forwarded_with_its_ticket() {
+    let dir = private_dir();
+    let ledger = tempfile::tempdir().unwrap();
+    let cg = no_limit_cgroup();
+    let (base, seen) = upstream(0).await;
+    let mut cfg = spool_config(dir.path());
+    cfg.ledger_dir = Some(ledger.path().display().to_string());
+    cfg.ticket_upstream_hosts = vec!["127.0.0.1".into()];
+    let app = router(&base, Some((cfg, cg.path())), 0);
+    let body = big_image_body();
+    let cl = ("content-length", body.len().to_string());
+
+    // No ticket, and a ticket the ledger does not hold.
+    let (status, v) = send(&app, Body::from(body.clone()), std::slice::from_ref(&cl)).await;
+    assert_eq!(
+        (status.as_u16(), v["error"]["code"].as_str()),
+        (503, Some("capacity_ticket_missing")),
+        "{v}"
+    );
+    let ticket = ("x-ai-gateway-capacity-ticket", TICKET.to_string());
+    let (status, v) = send(&app, chunked(body.clone()), std::slice::from_ref(&ticket)).await;
+    assert_eq!(
+        (status.as_u16(), v["error"]["code"].as_str()),
+        (503, Some("capacity_ticket_invalid")),
+        "{v}"
+    );
+    assert!(seen.lock().unwrap().is_empty());
+
+    std::fs::write(ledger.path().join(TICKET), b"ticket").unwrap();
+    let (status, v) = send(&app, chunked(body.clone()), std::slice::from_ref(&ticket)).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let got = seen.lock().unwrap()[0].clone();
+    let mut want: Value = serde_json::from_str(&body).unwrap();
+    want["model"] = json!("gpt-4o");
+    let want = serde_json::to_vec(&want).unwrap();
+    assert_eq!(got.len, want.len());
+    assert_eq!(got.content_length, Some(want.len().to_string()));
+    assert_eq!(
+        got.ticket.as_deref(),
+        Some(TICKET),
+        "forwarded to the internal upstream"
+    );
+    assert!(got.sha == Sha256::digest(&want).to_vec());
+    // The lease ended with the handler: keeper's waiter can take the ticket.
+    let keeper = std::fs::File::open(ledger.path().join(TICKET)).unwrap();
+    rustix::fs::flock(
+        &keeper,
+        rustix::fs::FlockOperation::NonBlockingLockExclusive,
+    )
+    .unwrap();
+    drop(keeper);
+
+    // An upstream host that is not listed never sees the ticket.
+    let mut cfg = spool_config(dir.path());
+    cfg.ledger_dir = Some(ledger.path().display().to_string());
+    let app = router(&base, Some((cfg, cg.path())), 0);
+    let (status, _) = send(&app, Body::from(body), &[cl, ticket]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(seen.lock().unwrap()[1].ticket, None);
+}
