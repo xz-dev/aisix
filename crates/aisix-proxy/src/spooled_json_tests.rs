@@ -110,3 +110,20 @@ async fn a_panic_closes_the_spool() {
     assert!(task.await.unwrap_err().is_panic());
     assert_eq!(open_spools(dir.path()), 0);
 }
+
+/// A declared length over the body cap is a 413, not the 503 for a
+/// missing ticket (the router's own Content-Length check runs first in
+/// production; this is the extractor's).
+#[tokio::test]
+async fn a_declared_length_over_the_cap_is_a_413() {
+    let dir = private_dir();
+    let mut req = json_req("{}".into());
+    req.headers_mut().insert(
+        axum::http::header::CONTENT_LENGTH,
+        (300u64 << 20).to_string().parse().unwrap(),
+    );
+    match read(&spool_cfg(dir.path()), req, 256 << 20).await {
+        Err(ProxyError::RequestTooLarge { limit_bytes }) => assert_eq!(limit_bytes, 256 << 20),
+        other => panic!("{:?}", other.map(|(v, _)| v)),
+    }
+}

@@ -166,7 +166,7 @@ impl MemoryBudget {
 
     /// `memory.max − memory.current`; `None` when the cgroup sets no limit
     /// (no file, or `max`).
-    fn headroom(&self) -> Option<u64> {
+    pub(crate) fn headroom(&self) -> Option<u64> {
         let read = |f: &str| std::fs::read_to_string(self.cgroup.join(f)).ok();
         let max: u64 = read("memory.max")?.trim().parse().ok()?;
         let current: u64 = read("memory.current")?.trim().parse().ok()?;

@@ -50,6 +50,12 @@ impl BodySpool {
     /// a startup error naming it.
     pub fn from_config(cfg: &aisix_core::config::BodySpoolConfig) -> Result<Option<Self>, String> {
         if cfg.threshold_bytes == 0 {
+            if !cfg.route_ceilings.is_empty() || cfg.ledger_dir.is_some() {
+                tracing::warn!(
+                    "body_spool.threshold_bytes is 0: the spool, its route ceilings, \
+                     ticket checks and memory charge are all off"
+                );
+            }
             return Ok(None);
         }
         let dir = PathBuf::from(
@@ -68,7 +74,16 @@ impl BodySpool {
                 n => n,
             },
             ceilings: cfg.route_ceilings.clone(),
-            memory: MemoryBudget::new("/sys/fs/cgroup"),
+            memory: {
+                let memory = MemoryBudget::new("/sys/fs/cgroup");
+                if memory.headroom().is_none() {
+                    tracing::warn!(
+                        "body_spool: /sys/fs/cgroup/memory.max is absent or `max`, \
+                         so the per-request memory charge never refuses"
+                    );
+                }
+                memory
+            },
         }))
     }
 
@@ -192,6 +207,10 @@ pub(crate) async fn read(
         .headers()
         .get(axum::http::header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok()?.parse::<u64>().ok());
+    // Over the body cap is a 413 whatever else is missing.
+    if limit > 0 && declared.is_some_and(|n| n > limit as u64) {
+        return Err(ProxyError::RequestTooLarge { limit_bytes: limit });
+    }
     let ticket = req
         .headers()
         .get(capacity::TICKET_HEADER)
