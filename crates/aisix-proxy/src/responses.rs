@@ -1470,16 +1470,7 @@ async fn responses_to_target(
         }
     }
     let client = crate::http_client::client_for(pk_entry.value.upstream_connection().as_ref());
-    let mut req = url.post_on(&client).headers(headers);
-    // #554: non-streaming gets the E2E request timeout via reqwest's
-    // request-level timeout. Streaming must NOT use it (it would cap the
-    // whole stream); the streaming branch below enforces the per-chunk
-    // read timeout instead.
-    if !is_stream {
-        if let Some(d) = timeouts.request {
-            req = req.timeout(d);
-        }
-    }
+    let req = url.post_on(&client).headers(headers);
     let send_started = Instant::now();
     // least_busy: count this target as in-flight for the upstream call
     // (mirrors chat.rs). Non-streaming / error paths drop the guard at
@@ -1487,17 +1478,23 @@ async fn responses_to_target(
     // end-of-stream closure next to `stream_hold`, so the count stays
     // raised for the stream's full lifetime.
     let in_flight = state.runtime_status.begin_in_flight(model_id);
-    // Streaming bounds the wait for response headers by the stream deadline
-    // (reqwest's request-level timeout can't be used — it would cap the
-    // whole stream), armed once the last body byte is written; the upload
-    // before it is bounded by the same value per gap with no progress (D8),
-    // so a slow upstream that keeps reading is not cut at the deadline.
-    // Non-streaming relies on the request-level timeout set above.
+    // The deadline (the stream budget, or for non-streaming the request
+    // timeout, #554) is armed once the last body byte is written; the
+    // upload before it is bounded by the same value per gap with no
+    // progress (D8), so a slow upstream that keeps reading is not cut at
+    // the deadline. Streaming bounds the wait for response headers with it
+    // (the per-chunk read timeout takes over after); non-streaming also
+    // bounds the response body read (`body_until`), as reqwest's
+    // request-level timeout did, but counted from the upload's end.
     // A spooled body is always streamed: its blobs are spliced in from the
     // spool (D2), and the serialized skeleton must never go out as is.
     let store = spooled.and_then(|sp| sp.store.clone());
-    let stream_deadline = timeouts.stream.filter(|_| is_stream);
-    let sent = match (store, stream_deadline) {
+    let deadline = if is_stream {
+        timeouts.stream
+    } else {
+        timeouts.request
+    };
+    let sent = match (store, deadline) {
         (Some(store), d) => {
             let body = store
                 .plan(body_bytes.clone())
@@ -1514,16 +1511,15 @@ async fn responses_to_target(
             )
             .await
         }
-        (None, None) => {
-            crate::stream_timeout::send_with_deadline(
-                req.body(body_bytes.clone()),
-                None,
-                send_started,
-            )
-            .await
-        }
+        (None, None) => crate::stream_timeout::send_with_deadline(
+            req.body(body_bytes.clone()),
+            None,
+            send_started,
+        )
+        .await
+        .map(|resp| (resp, None)),
     };
-    let upstream_resp = sent
+    let (upstream_resp, body_until) = sent
         .map_err(|be| {
             crate::cooldown::note_failure(
                 &state.runtime_status,
@@ -1533,6 +1529,8 @@ async fn responses_to_target(
             )
         })
         .map_err(ProxyError::Bridge)?;
+    // Only a non-streaming call bounds its body read this way.
+    let body_until = body_until.filter(|_| !is_stream);
     // Serialized once the upstream has answered, not before: a copy made
     // up front would be alive for the whole upstream wait.
     let captured_prompt = content_cap
@@ -1541,12 +1539,20 @@ async fn responses_to_target(
     let status = upstream_resp.status();
 
     if !status.is_success() {
-        let err = aisix_gateway::upstream_error_within(
-            connect_deadline,
-            upstream_resp,
-            aisix_provider_openai::held_route_http_error,
+        // The error body is bounded like any body read here: from the
+        // upload's end for a non-streaming call (`body_until`), and by the
+        // stream deadline for a streaming one.
+        let err = crate::stream_timeout::body_within(
+            body_until,
+            send_started,
+            aisix_gateway::upstream_error_within(
+                timeouts.stream.filter(|_| is_stream),
+                upstream_resp,
+                aisix_provider_openai::held_route_http_error,
+            ),
         )
-        .await;
+        .await
+        .map_err(ProxyError::Bridge)?;
         if let Some((ttl, reason)) = crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
         {
             state.runtime_status.mark_cooldown(model_id, ttl, reason);
@@ -2287,22 +2293,26 @@ async fn responses_to_target(
             captured_content: None,
         })
     } else {
-        let json_body: Value =
-            crate::dispatch::json_body_within(upstream_resp, buffered_body_deadline)
-                .await
-                .and_then(|body| match responses_body_in_band_error(&body) {
-                    Some(err) => Err(err),
-                    None => Ok(body),
-                })
-                .map_err(|be| {
-                    crate::cooldown::note_failure(
-                        &state.runtime_status,
-                        model_id,
-                        model.cooldown.as_ref(),
-                        be,
-                    )
-                })
-                .map_err(ProxyError::Bridge)?;
+        let json_body: Value = crate::stream_timeout::body_within(
+            body_until,
+            send_started,
+            crate::dispatch::json_body_within(upstream_resp, buffered_body_deadline),
+        )
+        .await
+        .and_then(|read| read)
+        .and_then(|body| match responses_body_in_band_error(&body) {
+            Some(err) => Err(err),
+            None => Ok(body),
+        })
+        .map_err(|be| {
+            crate::cooldown::note_failure(
+                &state.runtime_status,
+                model_id,
+                model.cooldown.as_ref(),
+                be,
+            )
+        })
+        .map_err(ProxyError::Bridge)?;
 
         // Extract the upstream-reported usage block for telemetry
         // emission. Pulled here (before the response is moved into

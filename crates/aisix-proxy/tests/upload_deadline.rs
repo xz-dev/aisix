@@ -1,7 +1,8 @@
-//! D8 (large-request-capacity task 4.5): the stream deadline of a
-//! `/v1/responses` send starts after the last body byte is written; before
-//! that it bounds each gap with no upload progress. An upstream that reads
-//! nothing gets an explicit timeout relayed to the client.
+//! D8 (large-request-capacity task 4.5): the deadline of a `/v1/responses`
+//! send (the stream budget, or the request timeout when not streaming)
+//! starts after the last body byte is written; before that it bounds each
+//! gap with no upload progress. An upstream that reads nothing gets an
+//! explicit timeout relayed to the client.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -37,9 +38,21 @@ async fn deaf_upstream() -> String {
 }
 
 /// A raw upstream that reads the body in small reads `gap` apart, so its
-/// upload takes several times the stream deadline, then streams a
-/// completed response.
+/// upload takes several times the deadline, then answers: a completed
+/// stream, or for `Answer::Json` a JSON response (for `Answer::Stall` the
+/// head and half of it, then nothing).
+#[derive(Clone, Copy, PartialEq)]
+enum Answer {
+    Sse,
+    Json,
+    Stall,
+}
+
 async fn slow_upstream(gap: Duration) -> String {
+    reading_upstream(gap, Answer::Sse).await
+}
+
+async fn reading_upstream(gap: Duration, answer: Answer) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -67,19 +80,37 @@ async fn slow_upstream(gap: Duration) -> String {
             got += n;
             tokio::time::sleep(gap).await;
         }
-        let done = r#"{"type":"response.completed","sequence_number":0,"response":{"id":"resp_slow","object":"response","status":"completed","model":"gpt-4o","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}"#;
-        let body = format!("event: response.completed\ndata: {done}\n\n");
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n{body}",
+        let resp_json = r#"{"id":"resp_slow","object":"response","status":"completed","model":"gpt-4o","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}"#;
+        let (ct, body) = match answer {
+            Answer::Sse => {
+                let done = format!(
+                    r#"{{"type":"response.completed","sequence_number":0,"response":{resp_json}}}"#
+                );
+                (
+                    "text/event-stream",
+                    format!("event: response.completed\ndata: {done}\n\n"),
+                )
+            }
+            Answer::Json | Answer::Stall => ("application/json", resp_json.to_string()),
+        };
+        let mut resp = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: {ct}\r\ncontent-length: {}\r\n\r\n{body}",
             body.len()
         );
+        if answer == Answer::Stall {
+            resp.truncate(resp.len() - body.len() / 2);
+        }
         s.write_all(resp.as_bytes()).await.unwrap();
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
     });
     format!("http://{addr}/v1")
 }
 
 fn app(api_base: &str, stream_timeout_ms: u64) -> axum::Router {
+    app_with(api_base, 0, stream_timeout_ms)
+}
+
+fn app_with(api_base: &str, timeout_ms: u64, stream_timeout_ms: u64) -> axum::Router {
     let snapshot = AisixSnapshot::new();
     let pk: ProviderKey = serde_json::from_value(json!({
         "display_name": "deaf", "secret": "test-upstream-credential",
@@ -121,7 +152,7 @@ fn app(api_base: &str, stream_timeout_ms: u64) -> axum::Router {
     build_router(
         ProxyState::new(SnapshotHandle::new(snapshot), hub, &config)
             .without_cache()
-            .with_default_timeouts(0, stream_timeout_ms),
+            .with_default_timeouts(timeout_ms, stream_timeout_ms),
     )
 }
 
@@ -179,4 +210,56 @@ async fn upstream_that_keeps_reading_slowly_is_not_cut_at_the_deadline() {
         took > Duration::from_millis(900),
         "the upload must outlast the deadline: {took:?}"
     );
+}
+
+async fn post(app: axum::Router, stream: bool) -> (StatusCode, String, Duration) {
+    let body = json!({"model": "m", "stream": stream, "input": "a".repeat(32 << 20)}).to_string();
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header("authorization", "Bearer test-caller")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let started = Instant::now();
+    let response = tokio::time::timeout(Duration::from_secs(60), app.oneshot(request))
+        .await
+        .expect("hung")
+        .unwrap();
+    let status = response.status();
+    let text = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    (
+        status,
+        String::from_utf8_lossy(&text).into_owned(),
+        started.elapsed(),
+    )
+}
+
+/// 4.5 non-streaming: the request timeout starts after the last body byte
+/// too, so an upstream that keeps reading for longer than it still answers.
+#[tokio::test]
+async fn non_streaming_slow_reader_is_not_cut_at_the_request_timeout() {
+    let up = reading_upstream(Duration::from_millis(4), Answer::Json).await;
+    let (status, text, took) = post(app_with(&up, 1000, 0), false).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert!(text.contains("resp_slow"), "{text}");
+    assert!(
+        took > Duration::from_millis(900),
+        "the upload must outlast the deadline: {took:?}"
+    );
+}
+
+/// 4.5 non-streaming: a deaf upstream and a stalled response body each get
+/// the explicit 504 timeout.
+#[tokio::test]
+async fn non_streaming_stalls_get_an_explicit_timeout() {
+    for up in [
+        deaf_upstream().await,
+        reading_upstream(Duration::ZERO, Answer::Stall).await,
+    ] {
+        let (status, text, took) = post(app_with(&up, 300, 0), false).await;
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{text}");
+        assert!(text.contains("\"type\":\"timeout\""), "{text}");
+        assert!(took >= Duration::from_millis(300) && took < Duration::from_secs(20));
+    }
 }
