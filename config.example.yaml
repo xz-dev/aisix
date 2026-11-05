@@ -673,7 +673,9 @@ shutdown:
 # upstream attempt; the rest of the body is limited to 16 MiB (8 MiB for a
 # ticketed body of 64 MiB or more). `dir` must be a disk volume (tmpfs and
 # ramfs are refused at startup), mode 0700 and empty; the image ships
-# /var/lib/aisix-spool for it.
+# /var/lib/aisix-spool for it. With threshold_bytes 0 the route ceilings and
+# the per-request memory charge are off too; the memory charge also needs a
+# cgroup memory.max other than `max` (startup logs a warning otherwise).
 #body_spool:
 #  threshold_bytes: 65536
 #  dir: /var/lib/aisix-spool

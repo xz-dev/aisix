@@ -2136,7 +2136,8 @@ impl Default for ShutdownConfig {
 #[serde(default)]
 pub struct BodySpoolConfig {
     /// Smallest string that is spooled. `0` (the default) turns the whole
-    /// feature off: bodies are buffered and parsed as before.
+    /// feature off: bodies are buffered and parsed as before, and the
+    /// route ceilings and the memory charge do not apply.
     pub threshold_bytes: u64,
     /// Spool directory: disk-backed (not tmpfs or ramfs), mode 0700, empty
     /// of regular files, and supporting `O_TMPFILE`. Required when on.

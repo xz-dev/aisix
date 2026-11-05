@@ -696,3 +696,63 @@ async fn the_lease_lives_as_long_as_the_spool() {
     eventually("the lease outlived the spool", keeper_can_lock).await;
     spools_closed(dir.path()).await;
 }
+
+/// A guardrail chain is a fallback path (D2): above 16 MiB it is refused
+/// by name; below, the chain runs on the whole body and the upstream gets
+/// the bytes the buffered path sends.
+#[tokio::test]
+async fn guardrail_chain_is_a_fallback_path() {
+    let with_guardrail = |s: &AisixSnapshot| {
+        let g: aisix_core::Guardrail = serde_json::from_value(json!({
+            "name": "allow-all", "enabled": true, "kind": "custom", "hook_point": "input",
+            "fail_open": false, "timeout_ms": 5000,
+            "script": "export function checkInput() { return { action: \"allow\" }; }"
+        }))
+        .unwrap();
+        let att: aisix_core::models::GuardrailAttachment = serde_json::from_value(
+            json!({"guardrail_id": "g-allow", "scope_type": "env", "priority": 100}),
+        )
+        .unwrap();
+        s.guardrail_attachments
+            .insert(ResourceEntry::new("att-g-allow", att, 1));
+        s.guardrails.insert(ResourceEntry::new("g-allow", g, 1));
+    };
+    let dir = private_dir();
+    let cg = no_limit_cgroup();
+    let (base, seen) = upstream(0).await;
+    let app = router_with(
+        &base,
+        Some((spool_config(dir.path()), cg.path())),
+        0,
+        with_guardrail,
+    );
+    let (status, v) = send(&app, Body::from(image_body("m", 9 * MIB, "hi")), &[]).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{v}");
+    assert_eq!(v["error"]["limit_bytes"], 16 * MIB);
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("fallback limit of guardrail chains"),
+        "{v}"
+    );
+    assert!(seen.lock().unwrap().is_empty());
+
+    let small = image_body("m", 200_000, "hi");
+    let (legacy_base, legacy_seen) = upstream(0).await;
+    let legacy = router_with(&legacy_base, None, 0, with_guardrail);
+    let (status, v) = send(&legacy, Body::from(small.clone()), &[]).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let (status, v) = send(&app, Body::from(small), &[]).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let (want, got) = (
+        legacy_seen.lock().unwrap()[0].clone(),
+        seen.lock().unwrap()[0].clone(),
+    );
+    assert_eq!(got.content_length, want.content_length);
+    assert!(
+        got.sha == want.sha,
+        "the guarded body differs from the buffered one"
+    );
+    spools_closed(dir.path()).await;
+}
