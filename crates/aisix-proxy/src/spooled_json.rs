@@ -81,10 +81,12 @@ impl BodySpool {
 
 /// What a spooled request carries through the handler: its blobs, its
 /// ticket lease and its memory charge, all released when it is dropped.
+/// The blob store holds the lease too, so a transport still sending the
+/// spool after the handler returned keeps the ticket's disk leased.
 #[derive(Debug)]
 pub(crate) struct Spooled {
     pub store: Option<Arc<BlobStore>>,
-    pub lease: Option<Lease>,
+    pub lease: Option<Arc<Lease>>,
     pub total: u64,
     cfg: Arc<BodySpool>,
     charge: std::sync::Mutex<Charge>,
@@ -201,6 +203,7 @@ pub(crate) async fn read(
         (Some(id), Some(ledger)) => Some(
             capacity::take_lease(ledger, id)
                 .await
+                .map(Arc::new)
                 .map_err(ProxyError::Capacity)?,
         ),
         _ => None,
@@ -274,6 +277,7 @@ pub(crate) async fn read(
             nonce: tok.nonce().to_string(),
             blobs: std::mem::take(&mut tok.blobs),
             spool,
+            _lease: lease.clone(),
         })
     });
     Ok((

@@ -25,6 +25,8 @@ pub(crate) struct BlobStore {
     pub nonce: String,
     pub blobs: Vec<Blob>,
     pub spool: SpoolFile,
+    /// The ticket lease, held as long as the spool is (D3).
+    pub _lease: Option<Arc<crate::capacity::Lease>>,
 }
 
 /// One attempt's outbound body: inline pieces of the serialized skeleton,
