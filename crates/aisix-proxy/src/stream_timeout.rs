@@ -300,17 +300,19 @@ async fn upload_deadline(
 }
 
 /// Send a request whose body may take long to upload (large `/v1/responses`
-/// bodies, D8). `deadline` (the stream budget) starts only after the last
-/// body byte is handed to the transport and bounds the wait for response
-/// headers; until then the same value bounds each gap with no upload
-/// progress. `None` sends with no deadline. `Content-Length` is set from
-/// the body.
+/// bodies, D8). `deadline` (the stream budget, or the request timeout for a
+/// non-streaming call) starts only after the last body byte is handed to
+/// the transport and bounds the wait for response headers; until then the
+/// same value bounds each gap with no upload progress. `None` sends with no
+/// deadline. `Content-Length` is set from the body. Also returns when
+/// `deadline` runs out counted from the upload's end (from the response
+/// head, if that came first), for a caller that bounds the body read.
 pub(crate) async fn send_with_upload_deadline(
     req: reqwest::RequestBuilder,
     body: ProgressBody,
     deadline: Option<Duration>,
     started: Instant,
-) -> Result<reqwest::Response, BridgeError> {
+) -> Result<(reqwest::Response, Option<tokio::time::Instant>), BridgeError> {
     let total = body.remaining;
     let progress = body.progress.clone();
     let req = req
@@ -319,17 +321,41 @@ pub(crate) async fn send_with_upload_deadline(
     let sent = match deadline {
         Some(d) => tokio::select! {
             res = req.send() => res.map_err(|e| crate::dispatch::reqwest_error_to_bridge(&e, started)),
-            e = upload_deadline(progress, d, total, started) => Err(e),
+            e = upload_deadline(progress.clone(), d, total, started) => Err(e),
         },
         None => req
             .send()
             .await
             .map_err(|e| crate::dispatch::reqwest_error_to_bridge(&e, started)),
     };
-    if let Ok(resp) = &sent {
-        aisix_gateway::note_upstream_response(resp.headers());
-    }
-    sent
+    let resp = sent?;
+    aisix_gateway::note_upstream_response(resp.headers());
+    let until = deadline.map(|d| match progress.done_ms.load(Ordering::Relaxed) {
+        0 => tokio::time::Instant::now() + d,
+        done => progress.start + Duration::from_millis(done - 1) + d,
+    });
+    Ok((resp, until))
+}
+
+/// Bound a non-streaming response-body read by the deadline
+/// [`send_with_upload_deadline`] returned: an explicit timeout when it runs
+/// out.
+pub(crate) async fn body_within<T>(
+    until: Option<tokio::time::Instant>,
+    started: Instant,
+    read: impl std::future::Future<Output = T>,
+) -> Result<T, BridgeError> {
+    let Some(until) = until else {
+        return Ok(read.await);
+    };
+    tokio::time::timeout_at(until, read)
+        .await
+        .map_err(|_| BridgeError::Timeout {
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            cause: "upstream response body did not finish within the request timeout \
+                    counted from the end of the request upload"
+                .to_string(),
+        })
 }
 
 #[cfg(test)]
@@ -431,7 +457,9 @@ mod tests {
     ) -> Result<reqwest::Response, BridgeError> {
         let req = reqwest::Client::new().post(format!("http://{addr}/"));
         let body = ProgressBody::from_bytes(Bytes::from(vec![b'a'; len]));
-        send_with_upload_deadline(req, body, Some(d), Instant::now()).await
+        send_with_upload_deadline(req, body, Some(d), Instant::now())
+            .await
+            .map(|(resp, _)| resp)
     }
 
     /// D8: a transport that keeps taking body bytes, slower than the
