@@ -1397,10 +1397,7 @@ async fn responses_to_target(
     );
 
     let client = crate::http_client::client_for(pk_entry.value.upstream_connection().as_ref());
-    let mut req = url
-        .post_on(&client)
-        .headers(headers)
-        .body(body_bytes.clone());
+    let mut req = url.post_on(&client).headers(headers);
     // #554: non-streaming gets the E2E request timeout via reqwest's
     // request-level timeout. Streaming must NOT use it (it would cap the
     // whole stream); the streaming branch below enforces the per-chunk
@@ -1417,22 +1414,41 @@ async fn responses_to_target(
     // end-of-stream closure next to `stream_hold`, so the count stays
     // raised for the stream's full lifetime.
     let in_flight = state.runtime_status.begin_in_flight(model_id);
-    // Streaming bounds the connect by the stream deadline (reqwest's
-    // request-level timeout can't be used — it would cap the whole stream);
-    // non-streaming relies on the request-level timeout set above.
-    let connect_deadline = if is_stream { timeouts.stream } else { None };
-    let upstream_resp =
-        crate::stream_timeout::send_with_deadline(req, connect_deadline, send_started)
+    // Streaming bounds the wait for response headers by the stream deadline
+    // (reqwest's request-level timeout can't be used — it would cap the
+    // whole stream), armed once the last body byte is written; the upload
+    // before it is bounded by the same value per gap with no progress (D8),
+    // so a slow upstream that keeps reading is not cut at the deadline.
+    // Non-streaming relies on the request-level timeout set above.
+    let sent = match timeouts.stream.filter(|_| is_stream) {
+        Some(d) => {
+            crate::stream_timeout::send_with_upload_deadline(
+                req,
+                crate::stream_timeout::ProgressBody::from_bytes(body_bytes.clone()),
+                Some(d),
+                send_started,
+            )
             .await
-            .map_err(|be| {
-                crate::cooldown::note_failure(
-                    &state.runtime_status,
-                    model_id,
-                    model.cooldown.as_ref(),
-                    be,
-                )
-            })
-            .map_err(ProxyError::Bridge)?;
+        }
+        None => {
+            crate::stream_timeout::send_with_deadline(
+                req.body(body_bytes.clone()),
+                None,
+                send_started,
+            )
+            .await
+        }
+    };
+    let upstream_resp = sent
+        .map_err(|be| {
+            crate::cooldown::note_failure(
+                &state.runtime_status,
+                model_id,
+                model.cooldown.as_ref(),
+                be,
+            )
+        })
+        .map_err(ProxyError::Bridge)?;
     // Serialized once the upstream has answered, not before: a copy made
     // up front would be alive for the whole upstream wait.
     let captured_prompt = content_cap.map(|_| serde_json::to_string(body).unwrap_or_default());
