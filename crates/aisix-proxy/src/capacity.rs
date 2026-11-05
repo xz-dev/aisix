@@ -13,6 +13,8 @@ use std::sync::Arc;
 pub(crate) const HOP: &str = "aisix";
 /// Request header that carries the capacity ticket id.
 pub(crate) const TICKET_HEADER: &str = "x-ai-gateway-capacity-ticket";
+/// Every hop opens the ticket at `<ledger>/<id>.ticket` (D4; keeper names it).
+pub(crate) const TICKET_SUFFIX: &str = ".ticket";
 /// Bodies at or above this size need a ticket.
 pub(crate) const TICKET_THRESHOLD: u64 = 64 << 20;
 /// Margin the memory charge keeps under `memory.max`.
@@ -118,14 +120,14 @@ pub(crate) struct Lease {
     pub id: String,
 }
 
-/// Take the lease on ticket `id` in the read-only `ledger`: open it
+/// Take the lease on ticket `id` in the read-only `ledger`: open `<id>.ticket`
 /// read-only and close-on-exec, block on a shared `flock`, then require a
 /// link — a ticket released while we waited has none.
 pub(crate) async fn take_lease(ledger: &Path, id: &str) -> Result<Lease, CapacityError> {
     if id.len() != 32 || !id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
         return Err(CapacityError::ticket_invalid("malformed id"));
     }
-    let path = ledger.join(id);
+    let path = ledger.join(format!("{id}{TICKET_SUFFIX}"));
     let id = id.to_string();
     tokio::task::spawn_blocking(move || {
         let file = std::fs::File::open(&path)

@@ -437,7 +437,7 @@ async fn a_ticketed_large_body_is_leased_and_forwarded_with_its_ticket() {
     );
     assert!(seen.lock().unwrap().is_empty());
 
-    std::fs::write(ledger.path().join(TICKET), b"ticket").unwrap();
+    std::fs::write(ledger.path().join(format!("{TICKET}.ticket")), b"ticket").unwrap();
     let (status, v) = send(&app, chunked(body.clone()), std::slice::from_ref(&ticket)).await;
     assert_eq!(status, StatusCode::OK, "{v}");
     let got = seen.lock().unwrap()[0].clone();
@@ -453,7 +453,7 @@ async fn a_ticketed_large_body_is_leased_and_forwarded_with_its_ticket() {
     );
     assert!(got.sha == Sha256::digest(&want).to_vec());
     // The lease ended with the handler: keeper's waiter can take the ticket.
-    let keeper = std::fs::File::open(ledger.path().join(TICKET)).unwrap();
+    let keeper = std::fs::File::open(ledger.path().join(format!("{TICKET}.ticket"))).unwrap();
     rustix::fs::flock(
         &keeper,
         rustix::fs::FlockOperation::NonBlockingLockExclusive,
