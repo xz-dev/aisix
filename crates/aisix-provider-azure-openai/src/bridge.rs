@@ -515,8 +515,12 @@ fn upstream_model(ctx: &BridgeContext) -> Result<&str, BridgeError> {
 async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeError {
     let retry_after = aisix_gateway::parse_retry_after(resp.headers());
     let is_json = aisix_gateway::response_is_json(&resp);
+    let headers = resp.headers().clone();
     let body =
         aisix_gateway::read_body_capped(resp, aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES).await;
+    if let Some(relay) = aisix_gateway::upstream_relay(status.as_u16(), &headers, &body) {
+        return relay;
+    }
     // Skip the serde parse on non-JSON bodies (HTML error page from a
     // load-balancer / front door). Same guard as
     // `capture_upstream_error_http`.

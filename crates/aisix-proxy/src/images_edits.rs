@@ -651,18 +651,11 @@ async fn dispatch(
                         aisix_gateway::note_upstream_response(resp.headers());
                         let status = resp.status();
                         if !status.is_success() {
-                            let s = status.as_u16();
-                            let retry_after = aisix_gateway::parse_retry_after(resp.headers());
-                            let msg = resp.text().await.unwrap_or_default();
                             return Err(crate::cooldown::note_failure(
                                 tracker,
                                 model_id,
                                 cooldown_cfg,
-                                aisix_gateway::BridgeError::upstream_status_with_retry_after(
-                                    s,
-                                    msg.chars().take(1024).collect::<String>(),
-                                    retry_after,
-                                ),
+                                aisix_gateway::read_upstream_status_error(resp).await,
                             ));
                         }
                         let body_bytes = resp.bytes().await.map_err(|e| {

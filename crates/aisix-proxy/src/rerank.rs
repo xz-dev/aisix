@@ -623,19 +623,11 @@ async fn dispatch(
 
                         let status = upstream_resp.status();
                         if !status.is_success() {
-                            let status_u16 = status.as_u16();
-                            let retry_after =
-                                aisix_gateway::parse_retry_after(upstream_resp.headers());
-                            let message = upstream_resp.text().await.unwrap_or_default();
                             return Err(crate::cooldown::note_failure(
                                 tracker,
                                 model_id,
                                 cooldown_cfg,
-                                aisix_gateway::BridgeError::upstream_status_with_retry_after(
-                                    status_u16,
-                                    message.chars().take(1024).collect::<String>(),
-                                    retry_after,
-                                ),
+                                aisix_gateway::read_upstream_status_error(upstream_resp).await,
                             ));
                         }
 

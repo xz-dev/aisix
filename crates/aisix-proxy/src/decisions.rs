@@ -541,7 +541,13 @@ async fn dispatch(
                 let status = upstream_resp.status();
                 if !status.is_success() {
                     let retry_after = aisix_gateway::parse_retry_after(upstream_resp.headers());
+                    let headers = upstream_resp.headers().clone();
                     let error_body = upstream_resp.bytes().await.unwrap_or_default();
+                    if let Some(relay) =
+                        aisix_gateway::upstream_relay(status.as_u16(), &headers, &error_body)
+                    {
+                        return Err(ProxyError::Bridge(relay));
+                    }
                     return Err(ProxyError::Bridge(crate::cooldown::note_failure(
                         tracker,
                         model_id,

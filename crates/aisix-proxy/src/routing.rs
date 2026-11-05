@@ -101,6 +101,9 @@ pub fn is_retryable(err: &BridgeError, retry_on_429: bool, fallback_on_statuses:
         | BridgeError::InvalidRequest(_)
         | BridgeError::RequestTooLarge { .. }
         | BridgeError::InvalidUpstreamCredentials(_) => false,
+        // A provider 413 or an inner hop refusal is request-scoped (D9):
+        // never retried or failed over, whatever `fallback_on_statuses` says.
+        BridgeError::UpstreamRelay(_) => false,
         // A capability the adapter simply does not implement. Static per
         // adapter, so the same call answers the same way every time and a
         // retry can only add latency to a refusal the caller is going to

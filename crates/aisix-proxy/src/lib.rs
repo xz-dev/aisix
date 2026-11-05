@@ -7591,13 +7591,111 @@ data: [DONE]\n\n";
         assert!(events.iter().all(|e| e.status_code == 502));
     }
 
+    /// One route family for the D9 relay tests: the client route and body,
+    /// and the provider and upstream path the target speaks.
+    #[derive(Clone, Copy)]
+    struct RelayRoute {
+        provider: &'static str,
+        upstream_path: &'static str,
+        uri: &'static str,
+        body: &'static str,
+    }
+
+    /// `/v1/responses` passthrough to an OpenAI target.
+    const RELAY_RESPONSES: RelayRoute = RelayRoute {
+        provider: "openai",
+        upstream_path: "/v1/responses",
+        uri: "/v1/responses",
+        body: r#"{"model":"smart","input":"hi"}"#,
+    };
+    /// Bridged chat completions to an OpenAI target.
+    const RELAY_CHAT: RelayRoute = RelayRoute {
+        provider: "openai",
+        upstream_path: "/chat/completions",
+        uri: "/v1/chat/completions",
+        body: r#"{"model":"smart","messages":[{"role":"user","content":"hi"}]}"#,
+    };
+    /// `/v1/messages` passthrough to an Anthropic target.
+    const RELAY_MESSAGES: RelayRoute = RelayRoute {
+        provider: "anthropic",
+        upstream_path: "/v1/messages",
+        uri: "/v1/messages",
+        body: r#"{"model":"smart","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#,
+    };
+    /// `/v1/messages` translated to chat completions on an OpenAI target.
+    const RELAY_TRANSLATED: RelayRoute = RelayRoute {
+        provider: "openai",
+        upstream_path: "/chat/completions",
+        uri: "/v1/messages",
+        body: r#"{"model":"smart","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#,
+    };
+    /// `/v1/rerank`, a route that proxies to the upstream directly.
+    const RELAY_RERANK: RelayRoute = RelayRoute {
+        provider: "openai",
+        upstream_path: "/v1/rerank",
+        uri: "/v1/rerank",
+        body: r#"{"model":"smart","query":"q","documents":["a","b"]}"#,
+    };
+
+    fn relay_pk(
+        id: &str,
+        api_base: &str,
+        provider: &str,
+    ) -> ResourceEntry<aisix_core::ProviderKey> {
+        let pk = serde_json::from_value(serde_json::json!({
+            "display_name": format!("relay-{id}"),
+            "secret": "sk-upstream",
+            "api_base": api_base,
+            "provider": provider,
+            "adapter": provider,
+        }))
+        .unwrap();
+        ResourceEntry::new(id, pk, 1)
+    }
+
+    fn relay_model(id: &str, name: &str, pk_id: &str, provider: &str) -> Model {
+        let model_name = if provider == "anthropic" {
+            "claude-3-5-haiku-20241022"
+        } else {
+            "gpt-4o"
+        };
+        serde_json::from_value(serde_json::json!({
+            "display_name": name,
+            "provider": provider,
+            "model_name": model_name,
+            "provider_key_id": pk_id,
+        }))
+        .unwrap_or_else(|e| panic!("model {id}: {e}"))
+    }
+
+    fn relay_hub() -> Arc<Hub> {
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        hub.register_specialized(
+            "anthropic",
+            Arc::new(aisix_provider_anthropic::AnthropicBridge::new()),
+        );
+        hub
+    }
+
+    fn relay_request(route: RelayRoute) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(route.uri)
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .header("anthropic-version", "2023-06-01")
+            .body(Body::from(route.body))
+            .unwrap()
+    }
+
     /// large-request-capacity D9: `body` from the primary of a two-target
     /// group (retries 2, cooldown on) reaches the caller unchanged on two
     /// requests in a row: one attempt each, never the secondary, no cooldown.
-    async fn assert_responses_relay_unchanged(status: u16, body: &str) {
+    async fn assert_relay_unchanged(route: RelayRoute, status: u16, body: &str) {
         let primary = MockServer::builder().start().await;
         Mock::given(method("POST"))
-            .and(path("/v1/responses"))
+            .and(path(route.upstream_path))
             .respond_with(
                 ResponseTemplate::new(status)
                     .insert_header("x-upstream-marker", "kept")
@@ -7613,22 +7711,23 @@ data: [DONE]\n\n";
             .mount(&secondary)
             .await;
 
-        let hub = Arc::new(Hub::new());
-        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
         let snap = AisixSnapshot::new();
         snap.provider_keys
-            .insert(pk_entry_with_id("pk-a", &primary.uri()));
+            .insert(relay_pk("pk-a", &primary.uri(), route.provider));
         snap.provider_keys
-            .insert(pk_entry_with_id("pk-b", &secondary.uri()));
-        let mut first = model_entry_with_id("m-a", "primary", "pk-a");
-        first.value.cooldown = Some(aisix_core::CooldownConfig {
+            .insert(relay_pk("pk-b", &secondary.uri(), route.provider));
+        let mut first = relay_model("m-a", "primary", "pk-a", route.provider);
+        first.cooldown = Some(aisix_core::CooldownConfig {
             enabled: Some(true),
             trigger_statuses: Some(vec![413, 503, 507]),
             ..Default::default()
         });
-        snap.models.insert(first);
-        snap.models
-            .insert(model_entry_with_id("m-b", "secondary", "pk-b"));
+        snap.models.insert(ResourceEntry::new("m-a", first, 1));
+        snap.models.insert(ResourceEntry::new(
+            "m-b",
+            relay_model("m-b", "secondary", "pk-b", route.provider),
+            1,
+        ));
         snap.models.insert(routing_entry(
             "smart",
             "failover",
@@ -7638,74 +7737,44 @@ data: [DONE]\n\n";
             None,
         ));
         snap.apikeys.insert(apikey_entry("sk-caller", &["smart"]));
-        let app = build_router(build_state(snap, hub));
+        let app = build_router(build_state(snap, relay_hub()));
 
         for _ in 0..2 {
-            let req = Request::builder()
-                .method("POST")
-                .uri("/v1/responses")
-                .header("authorization", "Bearer sk-caller")
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"model":"smart","input":"hi"}"#))
-                .unwrap();
-            let resp = run(app.clone(), req).await;
-            assert_eq!(resp.status().as_u16(), status);
+            let resp = run(app.clone(), relay_request(route)).await;
+            assert_eq!(resp.status().as_u16(), status, "{}", route.uri);
             assert_eq!(resp.headers()["x-upstream-marker"], "kept");
             assert_eq!(resp.headers()["content-type"], "application/json");
             let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
-            assert_eq!(std::str::from_utf8(&bytes).unwrap(), body);
+            assert_eq!(std::str::from_utf8(&bytes).unwrap(), body, "{}", route.uri);
         }
         // The mocks' `.expect` counts are checked on drop.
     }
 
-    #[tokio::test]
-    async fn responses_relays_inner_503_with_hop_unchanged() {
-        assert_responses_relay_unchanged(
-            503,
-            r#"{"error":{"message":"cpa: memory charge of 9437184 bytes refused","type":"server_error","code":"insufficient_memory","hop":"cpa","limit_bytes":42991616}}"#,
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn responses_relays_inner_507_with_hop_unchanged() {
-        assert_responses_relay_unchanged(
-            507,
-            r#"{"error":{"message":"cpa: spool write refused","type":"server_error","code":"insufficient_storage","hop":"cpa","limit_bytes":1073741824}}"#,
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn responses_relays_provider_413_unchanged() {
-        assert_responses_relay_unchanged(
-            413,
-            r#"{"error":{"code":"request_too_large","message":"mock provider: request entity too large","type":"invalid_request_error"}}"#,
-        )
-        .await;
-    }
+    const INNER_503: &str = r#"{"error":{"message":"cpa: memory charge of 9437184 bytes refused","type":"server_error","code":"insufficient_memory","hop":"cpa","limit_bytes":42991616}}"#;
+    const INNER_507: &str = r#"{"error":{"message":"cpa: spool write refused","type":"server_error","code":"insufficient_storage","hop":"cpa","limit_bytes":1073741824}}"#;
+    const PROVIDER_413: &str = r#"{"error":{"code":"request_too_large","message":"mock provider: request entity too large","type":"invalid_request_error"}}"#;
+    const PLAIN_503: &str =
+        r#"{"error":{"message":"busy","type":"server_error","code":"insufficient_memory"}}"#;
 
     /// A 503 without `hop` is an ordinary upstream fault: retried on the
-    /// same target (retries 2 → 3 attempts), then the generic 502 envelope.
-    #[tokio::test]
-    async fn responses_plain_503_without_hop_keeps_retry_handling() {
+    /// same target (retries 2 → 3 attempts), then the route's own 502
+    /// envelope, never the upstream body.
+    async fn assert_plain_503_keeps_retry_handling(route: RelayRoute) -> serde_json::Value {
         let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
-            .and(path("/v1/responses"))
-            .respond_with(ResponseTemplate::new(503).set_body_raw(
-                r#"{"error":{"message":"busy","type":"server_error","code":"insufficient_memory"}}"#,
-                "application/json",
-            ))
+            .and(path(route.upstream_path))
+            .respond_with(ResponseTemplate::new(503).set_body_raw(PLAIN_503, "application/json"))
             .expect(3)
             .mount(&upstream)
             .await;
-        let hub = Arc::new(Hub::new());
-        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
         let snap = AisixSnapshot::new();
         snap.provider_keys
-            .insert(pk_entry_with_id("pk-a", &upstream.uri()));
-        snap.models
-            .insert(model_entry_with_id("m-a", "primary", "pk-a"));
+            .insert(relay_pk("pk-a", &upstream.uri(), route.provider));
+        snap.models.insert(ResourceEntry::new(
+            "m-a",
+            relay_model("m-a", "primary", "pk-a", route.provider),
+            1,
+        ));
         snap.models.insert(routing_entry(
             "smart",
             "failover",
@@ -7715,18 +7784,96 @@ data: [DONE]\n\n";
             None,
         ));
         snap.apikeys.insert(apikey_entry("sk-caller", &["smart"]));
-        let app = build_router(build_state(snap, hub));
-        let req = Request::builder()
-            .method("POST")
-            .uri("/v1/responses")
-            .header("authorization", "Bearer sk-caller")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"model":"smart","input":"hi"}"#))
-            .unwrap();
-        let resp = run(app, req).await;
-        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let app = build_router(build_state(snap, relay_hub()));
+        let resp = run(app, relay_request(route)).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "{}", route.uri);
         let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_ne!(std::str::from_utf8(&bytes).unwrap(), PLAIN_503);
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn responses_relays_inner_503_with_hop_unchanged() {
+        assert_relay_unchanged(RELAY_RESPONSES, 503, INNER_503).await;
+    }
+
+    #[tokio::test]
+    async fn responses_relays_inner_507_with_hop_unchanged() {
+        assert_relay_unchanged(RELAY_RESPONSES, 507, INNER_507).await;
+    }
+
+    #[tokio::test]
+    async fn responses_relays_provider_413_unchanged() {
+        assert_relay_unchanged(RELAY_RESPONSES, 413, PROVIDER_413).await;
+    }
+
+    #[tokio::test]
+    async fn responses_plain_503_without_hop_keeps_retry_handling() {
+        let v = assert_plain_503_keeps_retry_handling(RELAY_RESPONSES).await;
+        assert_eq!(v["error"]["type"], "upstream_error");
+    }
+
+    #[tokio::test]
+    async fn chat_relays_inner_503_with_hop_unchanged() {
+        assert_relay_unchanged(RELAY_CHAT, 503, INNER_503).await;
+    }
+
+    #[tokio::test]
+    async fn chat_relays_provider_413_unchanged() {
+        assert_relay_unchanged(RELAY_CHAT, 413, PROVIDER_413).await;
+    }
+
+    #[tokio::test]
+    async fn chat_plain_503_without_hop_keeps_retry_handling() {
+        let v = assert_plain_503_keeps_retry_handling(RELAY_CHAT).await;
+        assert_eq!(v["error"]["type"], "upstream_error");
+    }
+
+    #[tokio::test]
+    async fn messages_passthrough_relays_inner_503_with_hop_unchanged() {
+        assert_relay_unchanged(RELAY_MESSAGES, 503, INNER_503).await;
+    }
+
+    #[tokio::test]
+    async fn messages_passthrough_relays_provider_413_unchanged() {
+        assert_relay_unchanged(RELAY_MESSAGES, 413, PROVIDER_413).await;
+    }
+
+    #[tokio::test]
+    async fn messages_passthrough_plain_503_without_hop_keeps_retry_handling() {
+        let v = assert_plain_503_keeps_retry_handling(RELAY_MESSAGES).await;
+        assert_eq!(v["type"], "error");
+    }
+
+    #[tokio::test]
+    async fn translated_messages_relay_inner_503_with_hop_unchanged() {
+        assert_relay_unchanged(RELAY_TRANSLATED, 503, INNER_503).await;
+    }
+
+    #[tokio::test]
+    async fn translated_messages_relay_provider_413_unchanged() {
+        assert_relay_unchanged(RELAY_TRANSLATED, 413, PROVIDER_413).await;
+    }
+
+    #[tokio::test]
+    async fn translated_messages_plain_503_without_hop_keeps_retry_handling() {
+        let v = assert_plain_503_keeps_retry_handling(RELAY_TRANSLATED).await;
+        assert_eq!(v["type"], "error");
+    }
+
+    #[tokio::test]
+    async fn rerank_relays_inner_503_with_hop_unchanged() {
+        assert_relay_unchanged(RELAY_RERANK, 503, INNER_503).await;
+    }
+
+    #[tokio::test]
+    async fn rerank_relays_provider_413_unchanged() {
+        assert_relay_unchanged(RELAY_RERANK, 413, PROVIDER_413).await;
+    }
+
+    #[tokio::test]
+    async fn rerank_plain_503_without_hop_keeps_retry_handling() {
+        let v = assert_plain_503_keeps_retry_handling(RELAY_RERANK).await;
         assert_eq!(v["error"]["type"], "upstream_error");
     }
 

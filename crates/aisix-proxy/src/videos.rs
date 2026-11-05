@@ -1274,12 +1274,16 @@ fn provider_call_once<'a>(
             .map_err(|e| note(crate::dispatch::reqwest_error_to_bridge(&e, started)))?;
         aisix_gateway::note_upstream_response(resp.headers());
         let status = resp.status().as_u16();
+        let headers = resp.headers().clone();
         let bytes = resp
             .bytes()
             .await
             .map_err(|e| note(aisix_gateway::BridgeError::UpstreamDecode(e.to_string())))?;
 
         if !(200..300).contains(&status) {
+            if let Some(relay) = aisix_gateway::upstream_relay(status, &headers, &bytes) {
+                return Err(note(relay));
+            }
             let message = parse_provider_error_message(&bytes);
             return Err(note(aisix_gateway::BridgeError::upstream_status(
                 status, message,
@@ -1394,6 +1398,7 @@ async fn proxy_content(
         // error body cannot hang the handler (the success path is already
         // bounded per-chunk; this closes the error branch).
         let code = status.as_u16();
+        let headers = resp.headers().clone();
         let bytes = match stream_budget {
             Some(d) => tokio::time::timeout(d, resp.bytes())
                 .await
@@ -1402,6 +1407,9 @@ async fn proxy_content(
                 .unwrap_or_default(),
             None => resp.bytes().await.unwrap_or_default(),
         };
+        if let Some(relay) = aisix_gateway::upstream_relay(code, &headers, &bytes) {
+            return Err(ProxyError::Bridge(note(relay)));
+        }
         let message = parse_provider_error_message(&bytes);
         return Err(ProxyError::Bridge(note(
             aisix_gateway::BridgeError::upstream_status(code, message),

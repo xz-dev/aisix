@@ -1549,14 +1549,8 @@ async fn responses_to_target(
                 .unwrap_or_default();
         // A provider 413 or an inner hop refusal goes back unchanged, with no
         // retry, failover or cooldown (D9).
-        if crate::capacity::relays_unchanged(status_u16, &body) {
-            return Err(ProxyError::UpstreamRelay(Box::new(
-                crate::error::UpstreamRelay {
-                    status: status_u16,
-                    headers,
-                    body,
-                },
-            )));
+        if let Some(relay) = aisix_gateway::upstream_relay(status_u16, &headers, &body) {
+            return Err(ProxyError::Bridge(relay));
         }
         let message = String::from_utf8_lossy(&body);
         let err = aisix_gateway::BridgeError::upstream_status_with_retry_after(

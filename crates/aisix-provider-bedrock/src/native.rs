@@ -267,9 +267,13 @@ async fn mantle_count_tokens(
             .get("x-amzn-errortype")
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
+        let headers = resp.headers().clone();
         let body =
             aisix_gateway::read_body_capped(resp, aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES)
                 .await;
+        if let Some(relay) = aisix_gateway::upstream_relay(status.as_u16(), &headers, &body) {
+            return Err(relay);
+        }
         return Err(crate::errors::upstream_error(
             status.as_u16(),
             kind,

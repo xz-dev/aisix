@@ -134,6 +134,8 @@ pub fn decide_cooldown(
         // bridge registration). Cooling down doesn't help; let it
         // surface and operator fixes the snapshot.
         BridgeError::Config(_) => None,
+        // A provider 413 or an inner hop refusal is request-scoped (D9).
+        BridgeError::UpstreamRelay(_) => None,
         _ => None,
     }
 }
