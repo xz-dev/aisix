@@ -506,7 +506,10 @@ pub async fn responses(
                 )
                 .map(|cap| {
                     CapturedContent::new(
-                        &serde_json::to_string(&body).unwrap_or_default(),
+                        &crate::splice::capture_json(
+                            &body,
+                            spooled.as_ref().and_then(|s| s.store.as_deref()),
+                        ),
                         "",
                         cap as usize,
                     )
@@ -1528,7 +1531,8 @@ async fn responses_to_target(
         .map_err(ProxyError::Bridge)?;
     // Serialized once the upstream has answered, not before: a copy made
     // up front would be alive for the whole upstream wait.
-    let captured_prompt = content_cap.map(|_| serde_json::to_string(body).unwrap_or_default());
+    let captured_prompt = content_cap
+        .map(|_| crate::splice::capture_json(body, spooled.and_then(|s| s.store.as_deref())));
 
     let status = upstream_resp.status();
 
@@ -2587,7 +2591,7 @@ async fn responses_cross_provider_to_target(
             })?;
         // Serialized once the upstream has answered, not before: a copy made
         // up front would be alive for the whole upstream wait.
-        let captured_prompt = content_cap.map(|_| serde_json::to_string(body).unwrap_or_default());
+        let captured_prompt = content_cap.map(|_| crate::splice::capture_json(body, None));
         // #554: peek the first chunk so a slow/erroring first token fails
         // over before the 200 is committed (when a stream budget is set);
         // the wrapper keeps enforcing the per-chunk read timeout either way.
@@ -2867,7 +2871,7 @@ async fn responses_cross_provider_to_target(
         })?;
     // Serialized once the upstream has answered, not before: a copy made
     // up front would be alive for the whole upstream wait.
-    let captured_prompt = content_cap.map(|_| serde_json::to_string(body).unwrap_or_default());
+    let captured_prompt = content_cap.map(|_| crate::splice::capture_json(body, None));
     state.health.record_success(&model.display_name);
     state.runtime_status.mark_healthy(model_id);
 
