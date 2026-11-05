@@ -930,7 +930,13 @@ async fn request_body_is_held_at_most_twice_while_upstream_is_pending() {
         "spooled body peaked {:.4}x over the body",
         peak_over_body / n
     );
-    assert_eq!(std::fs::read_dir(spool_dir.path()).unwrap().count(), 0);
+    // Spools are O_TMPFILE: count open fds on them, not directory entries.
+    let open_spools = std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
+        .filter(|l| l.starts_with(spool_dir.path()))
+        .count();
+    assert_eq!(open_spools, 0, "a spool fd stayed open");
     for (family, m, peak) in report {
         assert!(
             m <= family.limit(),

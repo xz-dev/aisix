@@ -278,11 +278,7 @@ async fn spooled_path_sends_the_buffered_bytes_on_every_attempt() {
         );
         assert!(a.ticket.is_none());
     }
-    assert_eq!(
-        std::fs::read_dir(dir.path()).unwrap().count(),
-        0,
-        "no spool file left"
-    );
+    spools_closed(dir.path()).await;
 }
 
 #[tokio::test]
@@ -538,4 +534,165 @@ async fn content_capture_never_sees_a_marker() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+}
+
+/// Open fds of this process on a spool file in `dir`. Spools are
+/// `O_TMPFILE`, so they never show in `read_dir`; in /proc/self/fd they
+/// link to `<dir>/#<inode> (deleted)`.
+pub fn open_spools(dir: &std::path::Path) -> usize {
+    std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
+        .filter(|l| l.starts_with(dir))
+        .count()
+}
+
+/// Wait until `cond` holds, up to 10 s.
+async fn eventually(what: &str, mut cond: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !cond() {
+        assert!(std::time::Instant::now() < deadline, "{what}");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+async fn spools_closed(dir: &std::path::Path) {
+    eventually("a spool fd stayed open", || open_spools(dir) == 0).await;
+}
+
+#[test]
+fn open_spools_counts_an_anonymous_file() {
+    let dir = private_dir();
+    let fd = rustix::fs::open(
+        dir.path(),
+        rustix::fs::OFlags::TMPFILE | rustix::fs::OFlags::RDWR,
+        rustix::fs::Mode::from_raw_mode(0o600),
+    )
+    .unwrap();
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    assert_eq!(open_spools(dir.path()), 1);
+    drop(fd);
+    assert_eq!(open_spools(dir.path()), 0);
+}
+
+/// A body whose first 2 MiB arrive at once; the rest is up to the sender.
+fn held_body(
+    body: &str,
+) -> (
+    Body,
+    tokio::sync::mpsc::Sender<std::io::Result<bytes::Bytes>>,
+) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    let stream = async_stream::stream! {
+        while let Some(c) = rx.recv().await { yield c; }
+    };
+    let head = bytes::Bytes::copy_from_slice(&body.as_bytes()[..2 * MIB]);
+    tx.try_send(Ok(head)).unwrap();
+    (Body::from_stream(stream), tx)
+}
+
+/// D2: the spool is closed when the client aborts mid-body, by a read
+/// error or by dropping the request.
+#[tokio::test]
+async fn client_abort_closes_the_spool() {
+    let dir = private_dir();
+    let cg = no_limit_cgroup();
+    let (base, seen) = upstream(0).await;
+    let app = router(&base, Some((spool_config(dir.path()), cg.path())), 0);
+    let body = image_body("m", 4 * MIB, "hi");
+    for drop_it in [false, true] {
+        let (b, tx) = held_body(&body);
+        let task = tokio::spawn({
+            let app = app.clone();
+            async move { send(&app, b, &[]).await }
+        });
+        eventually("the spool never opened", || open_spools(dir.path()) == 1).await;
+        if drop_it {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        } else {
+            tx.send(Err(std::io::Error::other("reset"))).await.unwrap();
+            assert_eq!(task.await.unwrap().0, StatusCode::BAD_REQUEST);
+        }
+        spools_closed(dir.path()).await;
+    }
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+/// An upstream on raw TCP: reads one request head, writes `answer` (if
+/// any) and holds the socket for `hold` without reading, then closes it.
+async fn raw_upstream(answer: Option<&'static str>, hold: std::time::Duration) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut head = Vec::new();
+        let mut buf = [0u8; 4096];
+        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = sock.read(&mut buf).await.unwrap();
+            head.extend_from_slice(&buf[..n]);
+        }
+        if let Some(json) = answer {
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{json}",
+                json.len()
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+        }
+        tokio::time::sleep(hold).await;
+    });
+    format!("http://{addr}")
+}
+
+/// D2: the spool is closed when the upstream closes the connection before
+/// it has read the body.
+#[tokio::test]
+async fn upstream_early_close_closes_the_spool() {
+    let dir = private_dir();
+    let cg = no_limit_cgroup();
+    let base = raw_upstream(None, std::time::Duration::ZERO).await;
+    let app = router(&base, Some((spool_config(dir.path()), cg.path())), 0);
+    let (status, v) = send(&app, Body::from(image_body("m", 9 * MIB, "hi")), &[]).await;
+    assert!(status.is_server_error(), "{status} {v}");
+    spools_closed(dir.path()).await;
+}
+
+/// The ticket lease lives as long as the spool: an upstream that answers
+/// before it has read the body leaves the transport holding the spool
+/// after the handler returned, and the ticket stays leased until then.
+#[tokio::test]
+async fn the_lease_lives_as_long_as_the_spool() {
+    let dir = private_dir();
+    let ledger = tempfile::tempdir().unwrap();
+    let ticket_file = ledger.path().join(format!("{TICKET}.ticket"));
+    std::fs::write(&ticket_file, b"ticket").unwrap();
+    let cg = no_limit_cgroup();
+    const ANSWER: &str = r#"{"id":"resp_1","object":"response","status":"completed","model":"gpt-4o","output":[],"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}"#;
+    let base = raw_upstream(Some(ANSWER), std::time::Duration::from_secs(2)).await;
+    let mut cfg = spool_config(dir.path());
+    cfg.ledger_dir = Some(ledger.path().display().to_string());
+    let app = router(&base, Some((cfg, cg.path())), 0);
+    let ticket = ("x-ai-gateway-capacity-ticket", TICKET.to_string());
+    let (status, v) = send(&app, Body::from(big_image_body()), &[ticket]).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let keeper_can_lock = || {
+        let keeper = std::fs::File::open(&ticket_file).unwrap();
+        rustix::fs::flock(
+            &keeper,
+            rustix::fs::FlockOperation::NonBlockingLockExclusive,
+        )
+        .is_ok()
+    };
+    assert_eq!(
+        open_spools(dir.path()),
+        1,
+        "the transport still holds the spool"
+    );
+    assert!(
+        !keeper_can_lock(),
+        "the lease ended while the spool was open"
+    );
+    eventually("the lease outlived the spool", keeper_can_lock).await;
+    spools_closed(dir.path()).await;
 }

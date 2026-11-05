@@ -32,6 +32,7 @@ fn ingest_with(t: &mut Tokenizer, body: &[u8], chunk: usize) -> Result<Ingested,
             nonce: t.nonce().to_string(),
             blobs: t.blobs.clone(),
             spool,
+            _lease: None,
         })
     });
     Ok((std::mem::take(&mut t.skeleton), store))

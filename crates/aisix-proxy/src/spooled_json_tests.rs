@@ -81,3 +81,32 @@ fn spool_disk_io_does_not_stall_the_runtime() {
         );
     });
 }
+
+/// Open fds of this process on a spool file in `dir` (`O_TMPFILE` files
+/// never show in `read_dir`).
+fn open_spools(dir: &std::path::Path) -> usize {
+    std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
+        .filter(|l| l.starts_with(dir))
+        .count()
+}
+
+/// D2: a handler that panics while it holds the spooled request closes
+/// the spool as it unwinds.
+#[tokio::test]
+async fn a_panic_closes_the_spool() {
+    let dir = private_dir();
+    let cfg = spool_cfg(dir.path());
+    let task = tokio::spawn({
+        let (cfg, dir) = (cfg.clone(), dir.path().to_path_buf());
+        async move {
+            let (_v, sp) = read(&cfg, json_req(image_body(1 << 20)), 0).await.unwrap();
+            assert!(sp.store.is_some());
+            assert_eq!(open_spools(&dir), 1, "the spool is open");
+            panic!("handler panic");
+        }
+    });
+    assert!(task.await.unwrap_err().is_panic());
+    assert_eq!(open_spools(dir.path()), 0);
+}
