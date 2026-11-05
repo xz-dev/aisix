@@ -29,6 +29,9 @@ const K_SKEL: u64 = 5;
 const K_PATH: u64 = 4;
 /// Page-cache bound of one spool (D3), charged when a ticketed body arrives.
 const P_H: u64 = 16 * MIB;
+/// Body bytes fed to the tokenizer between spool drains: bounds the spool's
+/// write buffer to one batch plus one piece.
+const PIECE: usize = 256 << 10;
 
 /// The deployment's spool settings (`body_spool`), checked at startup.
 #[derive(Debug)]
@@ -114,7 +117,11 @@ impl Spooled {
 
     /// Put the blobs back into `body` for a fallback path (`path` names
     /// it): refused above the fallback limit, charged before allocating.
-    pub(crate) fn rehydrate_for(&self, path: &str, body: &mut Value) -> Result<(), CapacityError> {
+    pub(crate) async fn rehydrate_for(
+        &self,
+        path: &str,
+        body: &mut Value,
+    ) -> Result<(), CapacityError> {
         let Some(store) = self.store.as_ref().filter(|s| !s.blobs.is_empty()) else {
             return Ok(());
         };
@@ -140,7 +147,7 @@ impl Spooled {
                 return Err(e);
             }
         }
-        store.rehydrate(body)
+        store.rehydrate(body).await
     }
 }
 
@@ -238,7 +245,7 @@ pub(crate) async fn read(
         if lease.is_none() && total >= capacity::TICKET_THRESHOLD {
             return Err(missing(why_missing));
         }
-        for piece in frame.chunks(MIB as usize) {
+        for piece in frame.chunks(PIECE) {
             // Charge inline growth in 1 MiB steps before it is allocated.
             let need = (tok.skeleton.len() as u64 + piece.len() as u64).min(inline_limit + MIB);
             while charged < need {
@@ -246,6 +253,9 @@ pub(crate) async fn read(
                 charged += MIB;
             }
             tok.feed(piece).map_err(ingest)?;
+            if let Some(spool) = tok.spool_mut() {
+                spool.drain().await.map_err(ProxyError::Capacity)?;
+            }
             if tok.skeleton.len() as u64 > inline_limit {
                 return Err(ProxyError::Capacity(CapacityError::too_large(
                     inline_limit,
@@ -255,6 +265,9 @@ pub(crate) async fn read(
         }
     }
     tok.finish().map_err(ingest)?;
+    if let Some(spool) = tok.spool_mut() {
+        spool.finish().await.map_err(ProxyError::Capacity)?;
+    }
     let value: Value = serde_json::from_slice(&tok.skeleton).map_err(|_| invalid_json())?;
     let store = tok.take_spool().map(|spool| {
         Arc::new(BlobStore {
@@ -275,3 +288,7 @@ pub(crate) async fn read(
         },
     ))
 }
+
+#[cfg(test)]
+#[path = "spooled_json_tests.rs"]
+mod tests;

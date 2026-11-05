@@ -34,15 +34,20 @@ fn startup_check_refuses_tmpfs_wrong_mode_and_leftover_files() {
     assert!(err.contains("/nonexistent-spool"), "{err}");
 }
 
-#[test]
-fn spool_round_trips_without_a_name() {
+#[tokio::test]
+async fn spool_round_trips_without_a_name() {
     let dir = private_dir();
     let mut spool = SpoolFile::create(dir.path(), 0).unwrap();
     let data: Vec<u8> = (0..(20 << 20)).map(|i| (i % 251) as u8).collect();
     for chunk in data.chunks(100_000) {
-        spool.append(chunk).unwrap();
+        spool.append(chunk);
+        spool.drain().await.unwrap();
+        assert!(
+            spool.pending.len() < WRITE_BATCH,
+            "drained to under a batch"
+        );
     }
-    spool.finish().unwrap();
+    spool.finish().await.unwrap();
     assert_eq!(spool.len(), data.len() as u64);
     assert_eq!(
         std::fs::read_dir(dir.path()).unwrap().count(),
@@ -62,11 +67,11 @@ fn spool_round_trips_without_a_name() {
     assert_eq!(mode & 0o777, 0o600);
 }
 
-#[test]
-fn a_write_past_the_reserve_is_refused_with_507() {
+#[tokio::test]
+async fn a_write_past_the_reserve_is_refused_with_507() {
     let dir = private_dir();
     let mut spool = SpoolFile::create(dir.path(), u64::MAX / 2).unwrap();
-    spool.append(b"small").unwrap();
-    let err = spool.finish().unwrap_err();
+    spool.append(b"small");
+    let err = spool.finish().await.unwrap_err();
     assert_eq!((err.status, err.code), (507, "insufficient_storage"));
 }

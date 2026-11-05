@@ -679,6 +679,7 @@ async fn dispatch(
         // A guardrail chain reads the whole request: a fallback path.
         if let Some(sp) = spooled {
             sp.rehydrate_for("guardrail chains", body)
+                .await
                 .map_err(ProxyError::Capacity)?;
         }
         let chat = responses_input_to_chat(&model_name, body);
@@ -918,17 +919,20 @@ async fn dispatch(
             // fallback path and gets the whole body back.
             let prepared = match spooled {
                 None => Ok(None),
-                Some(sp) => sp
-                    .check_ceiling(&target.id)
-                    .and_then(|()| {
-                        if native || sp.store.as_ref().is_none_or(|s| s.blobs.is_empty()) {
-                            return Ok(None);
-                        }
+                Some(sp) => match sp.check_ceiling(&target.id) {
+                    Err(e) => Err(e),
+                    Ok(()) if native || sp.store.as_ref().is_none_or(|s| s.blobs.is_empty()) => {
+                        Ok(None)
+                    }
+                    Ok(()) => {
                         let mut full = attempt_body.clone();
                         let path = format!("bridged target {}", target.model.display_name);
-                        sp.rehydrate_for(&path, &mut full).map(|()| Some(full))
-                    })
-                    .map_err(ProxyError::Capacity),
+                        sp.rehydrate_for(&path, &mut full)
+                            .await
+                            .map(|()| Some(full))
+                    }
+                }
+                .map_err(ProxyError::Capacity),
             };
             let result = match prepared {
                 Err(e) => Err(e),

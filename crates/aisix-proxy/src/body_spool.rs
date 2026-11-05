@@ -8,6 +8,7 @@ use std::io;
 use std::num::NonZeroU64;
 use std::os::unix::fs::{FileExt, PermissionsExt};
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::capacity::CapacityError;
 
@@ -75,89 +76,132 @@ fn drop_cache(file: &File, from: u64, to: u64) {
 }
 
 /// One request's spool. Appended to while the body is read, then shared
-/// read-only by every attempt.
+/// read-only by every attempt. Disk writes, `fstatfs` and `fdatasync` run
+/// on the blocking pool ([`SpoolFile::drain`], [`SpoolFile::finish`]),
+/// never on a runtime worker; at most one batch plus one piece is buffered.
 #[derive(Debug)]
 pub(crate) struct SpoolFile {
-    file: File,
+    file: Arc<File>,
+    w: Written,
+    pending: Vec<u8>,
+}
+
+/// What is on disk: bytes written, bytes synced and dropped from the page
+/// cache, and the free-space reserve every write must leave.
+#[derive(Debug, Clone, Copy)]
+struct Written {
     len: u64,
     synced: u64,
     reserve: u64,
-    pending: Vec<u8>,
+    /// Test hook: a slow disk, sleeping this long per write.
+    #[cfg(test)]
+    delay: Option<std::time::Duration>,
+}
+
+/// Test hook: spools created in this directory get this per-write delay.
+#[cfg(test)]
+pub(crate) static SLOW_DISK: std::sync::Mutex<Option<(std::path::PathBuf, std::time::Duration)>> =
+    std::sync::Mutex::new(None);
+
+impl Written {
+    /// Blocking: write `buf` at the end, then sync and drop the page cache
+    /// every [`SYNC_EVERY`] bytes and at the `last` write.
+    fn write(&mut self, file: &File, buf: &[u8], last: bool) -> Result<(), CapacityError> {
+        #[cfg(test)]
+        if let Some(d) = self.delay {
+            std::thread::sleep(d);
+        }
+        if !buf.is_empty() {
+            let need = buf.len() as u64;
+            let fs = rustix::fs::fstatfs(file)
+                .map_err(|e| CapacityError::spool_io(&io::Error::from(e)))?;
+            #[allow(clippy::unnecessary_cast)]
+            let free = (fs.f_bavail as u64).saturating_mul(fs.f_frsize as u64);
+            if free.saturating_sub(need) < self.reserve {
+                return Err(CapacityError::insufficient_storage(
+                    need,
+                    free,
+                    self.reserve,
+                ));
+            }
+            file.write_all_at(buf, self.len)
+                .map_err(|e| CapacityError::spool_io(&e))?;
+            self.len += need;
+        }
+        if last || self.len - self.synced >= SYNC_EVERY {
+            file.sync_data().map_err(|e| CapacityError::spool_io(&e))?;
+            drop_cache(file, self.synced, self.len);
+            self.synced = self.len;
+        }
+        Ok(())
+    }
 }
 
 impl SpoolFile {
     pub(crate) fn create(dir: &Path, reserve: u64) -> Result<Self, CapacityError> {
         let file = open_tmpfile(dir).map_err(|e| CapacityError::spool_io(&e))?;
         Ok(Self {
-            file,
-            len: 0,
-            synced: 0,
-            reserve,
+            file: Arc::new(file),
+            w: Written {
+                len: 0,
+                synced: 0,
+                reserve,
+                #[cfg(test)]
+                delay: SLOW_DISK
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .filter(|(d, _)| d == dir)
+                    .map(|(_, delay)| *delay),
+            },
             pending: Vec::new(),
         })
     }
 
     /// Bytes written so far, pending batch included.
     pub(crate) fn len(&self) -> u64 {
-        self.len + self.pending.len() as u64
+        self.w.len + self.pending.len() as u64
     }
 
-    pub(crate) fn append(&mut self, mut buf: &[u8]) -> Result<(), CapacityError> {
-        while !buf.is_empty() {
-            if self.pending.capacity() == 0 {
-                self.pending.reserve_exact(WRITE_BATCH);
-            }
-            let n = buf.len().min(WRITE_BATCH - self.pending.len());
-            self.pending.extend_from_slice(&buf[..n]);
-            buf = &buf[n..];
-            if self.pending.len() == WRITE_BATCH {
-                self.flush()?;
-            }
-        }
-        Ok(())
+    /// Buffer `buf`; no I/O here. The caller drains after each piece.
+    pub(crate) fn append(&mut self, buf: &[u8]) {
+        self.pending.extend_from_slice(buf);
     }
 
-    fn flush(&mut self) -> Result<(), CapacityError> {
-        if self.pending.is_empty() {
+    /// Write the buffer out once it holds a full batch.
+    pub(crate) async fn drain(&mut self) -> Result<(), CapacityError> {
+        if self.pending.len() < WRITE_BATCH {
             return Ok(());
         }
-        let need = self.pending.len() as u64;
-        let fs = rustix::fs::fstatfs(&self.file)
-            .map_err(|e| CapacityError::spool_io(&io::Error::from(e)))?;
-        #[allow(clippy::unnecessary_cast)]
-        let free = (fs.f_bavail as u64).saturating_mul(fs.f_frsize as u64);
-        if free.saturating_sub(need) < self.reserve {
-            return Err(CapacityError::insufficient_storage(
-                need,
-                free,
-                self.reserve,
-            ));
-        }
-        self.file
-            .write_all_at(&self.pending, self.len)
-            .map_err(|e| CapacityError::spool_io(&e))?;
-        self.len += need;
-        self.pending.clear();
-        if self.len - self.synced >= SYNC_EVERY {
-            self.sync()?;
-        }
+        self.write_out(false).await
+    }
+
+    /// Write out the rest and drop its page cache; the spool is read-only
+    /// from here on.
+    pub(crate) async fn finish(&mut self) -> Result<(), CapacityError> {
+        self.write_out(true).await?;
+        self.pending = Vec::new();
         Ok(())
     }
 
-    fn sync(&mut self) -> Result<(), CapacityError> {
-        self.file
-            .sync_data()
-            .map_err(|e| CapacityError::spool_io(&e))?;
-        drop_cache(&self.file, self.synced, self.len);
-        self.synced = self.len;
-        Ok(())
+    async fn write_out(&mut self, last: bool) -> Result<(), CapacityError> {
+        let (file, mut w) = (self.file.clone(), self.w);
+        let mut buf = std::mem::take(&mut self.pending);
+        let (w, buf, res) = tokio::task::spawn_blocking(move || {
+            let res = w.write(&file, &buf, last);
+            buf.clear();
+            (w, buf, res)
+        })
+        .await
+        .map_err(|e| CapacityError::spool_io(&io::Error::other(e)))?;
+        (self.w, self.pending) = (w, buf);
+        res
     }
 
-    /// Write out the last batch and drop its page cache; the spool is
-    /// read-only from here on.
-    pub(crate) fn finish(&mut self) -> Result<(), CapacityError> {
-        self.flush()?;
-        self.sync()?;
+    /// [`SpoolFile::finish`] on the calling thread, for tests without a runtime.
+    #[cfg(test)]
+    pub(crate) fn finish_blocking(&mut self) -> Result<(), CapacityError> {
+        self.w.write(&self.file, &self.pending, true)?;
         self.pending = Vec::new();
         Ok(())
     }

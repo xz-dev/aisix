@@ -26,7 +26,8 @@ fn ingest_with(t: &mut Tokenizer, body: &[u8], chunk: usize) -> Result<Ingested,
         t.feed(c)?;
     }
     t.finish()?;
-    let store = t.take_spool().map(|spool| {
+    let store = t.take_spool().map(|mut spool| {
+        spool.finish_blocking().unwrap();
         Arc::new(BlobStore {
             nonce: t.nonce().to_string(),
             blobs: t.blobs.clone(),
@@ -45,6 +46,14 @@ fn ingest(body: &[u8], threshold: usize, chunk: usize) -> Result<Ingested, Inges
     ingest_with(&mut tokenizer(threshold), body, chunk)
 }
 
+fn block_on<F: std::future::Future>(f: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(f)
+}
+
 fn spliced(store: &Option<Arc<BlobStore>>, wire: Vec<u8>) -> Vec<u8> {
     use http_body_util::BodyExt;
     let Some(store) = store else { return wire };
@@ -52,14 +61,7 @@ fn spliced(store: &Option<Arc<BlobStore>>, wire: Vec<u8>) -> Vec<u8> {
     let len = plan.len;
     let body = plan.body(store.clone());
     // The blob reads run on spawn_blocking: give them a runtime.
-    let out = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(body.collect())
-        .unwrap()
-        .to_bytes()
-        .to_vec();
+    let out = block_on(body.collect()).unwrap().to_bytes().to_vec();
     assert_eq!(out.len() as u64, len, "Content-Length matches the bytes");
     out
 }
@@ -88,7 +90,7 @@ fn differential(body: &[u8]) -> Option<usize> {
                 "{shown}"
             );
             if let Some(store) = &store {
-                store.rehydrate(&mut v).unwrap();
+                block_on(store.rehydrate(&mut v)).unwrap();
             }
             assert_eq!(&v, legacy, "rehydrated value: {shown}");
             blobs = Some(store.map_or(0, |s| s.blobs.len()));
