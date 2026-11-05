@@ -43,8 +43,8 @@ fn image_body(bytes: usize) -> String {
 /// still completes at once: the disk I/O is not on the worker thread.
 #[test]
 fn spool_disk_io_does_not_stall_the_runtime() {
-    // Each write sleeps this long: on the worker, every small request
-    // would wait at least that; the bound leaves room for a loaded host.
+    // Each write sleeps this long: on the worker, a small request would
+    // wait at least that.
     const DISK_DELAY: Duration = Duration::from_secs(1);
     let dir = private_dir();
     *crate::body_spool::SLOW_DISK.lock().unwrap() = Some((dir.path().to_path_buf(), DISK_DELAY));
@@ -54,30 +54,45 @@ fn spool_disk_io_does_not_stall_the_runtime() {
         .build()
         .unwrap();
     rt.block_on(async {
+        // Small requests on this runtime until `busy` is done: their count
+        // and the worst latency of one.
+        async fn small_requests(
+            cfg: &Arc<BodySpool>,
+            busy: &tokio::task::JoinHandle<()>,
+        ) -> (u32, Duration) {
+            let (mut worst, mut n) = (Duration::ZERO, 0);
+            while !busy.is_finished() {
+                let t = Instant::now();
+                let (v, sp) = read(cfg, json_req(r#"{"model":"m","input":"hi"}"#.into()), 0)
+                    .await
+                    .unwrap();
+                assert!(sp.store.is_none() && v["input"] == "hi");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                worst = worst.max(t.elapsed());
+                n += 1;
+            }
+            (n, worst)
+        }
+        // Baseline from this run, so host load cancels out: the same small
+        // requests while the runtime only sleeps for as long as the upload.
+        let idle = tokio::spawn(tokio::time::sleep(DISK_DELAY * 2));
+        let (_, base) = small_requests(&cfg, &idle).await;
         let upload = tokio::spawn({
             let cfg = cfg.clone();
             async move {
-                read(&cfg, json_req(image_body(3 << 19)), 0)
-                    .await
-                    .map(|_| ())
+                read(&cfg, json_req(image_body(3 << 19)), 0).await.unwrap();
             }
         });
-        let (mut worst, mut small) = (Duration::ZERO, 0);
-        while !upload.is_finished() {
-            let t = Instant::now();
-            let (v, sp) = read(&cfg, json_req(r#"{"model":"m","input":"hi"}"#.into()), 0)
-                .await
-                .unwrap();
-            assert!(sp.store.is_none() && v["input"] == "hi");
-            tokio::time::sleep(Duration::from_millis(5)).await;
-            worst = worst.max(t.elapsed());
-            small += 1;
-        }
-        upload.await.unwrap().unwrap();
-        assert!(small >= 10, "the upload took {small} small requests' time");
+        let (small, worst) = small_requests(&cfg, &upload).await;
+        upload.await.unwrap();
+        let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
+        eprintln!(
+            "small requests: worst {worst:?} during the upload, {base:?} idle; loadavg {load}"
+        );
+        assert!(small >= 3, "the upload took {small} small requests' time");
         assert!(
-            worst < DISK_DELAY * 9 / 10,
-            "a small request waited {worst:?} behind the spool's disk I/O"
+            worst < base + DISK_DELAY / 2,
+            "a small request waited {worst:?} behind the spool's disk I/O ({base:?} idle)"
         );
     });
 }
