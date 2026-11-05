@@ -667,6 +667,27 @@ shutdown:
   # here by health check.
   min_drain_secs: 30
 
+# Large /v1/responses bodies (off by default). With threshold_bytes > 0,
+# media and file strings of at least that size are moved to an anonymous
+# file in `dir` while the body is read, and spliced back into each
+# upstream attempt; the rest of the body is limited to 16 MiB (8 MiB for a
+# ticketed body of 64 MiB or more). `dir` must be a disk volume (tmpfs and
+# ramfs are refused at startup), mode 0700 and empty; the image ships
+# /var/lib/aisix-spool for it.
+#body_spool:
+#  threshold_bytes: 65536
+#  dir: /var/lib/aisix-spool
+#  # Read-only capacity ledger; without it every body of 64 MiB or more
+#  # is refused (503 capacity_ticket_missing).
+#  ledger_dir: /run/capacity-ledger
+#  # Upstream hosts the capacity ticket header may be sent to.
+#  ticket_upstream_hosts: [cli-proxy-api]
+#  # Free bytes a spool write must leave (0 = 1 GiB).
+#  disk_reserve_bytes: 0
+#  # Request ceilings in bytes, keyed by model resource id.
+#  route_ceilings:
+#    bedrock-claude: 20000000
+
 # Models, API keys, provider keys, guardrails, cache policies, and
 # observability exporters are NOT defined in this file. They come from
 # the configured resource source: the `resources_file` above, direct

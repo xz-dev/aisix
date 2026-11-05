@@ -43,8 +43,9 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates tini \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin aisix \
-    && mkdir -p /etc/aisix/tls /var/lib/aisix \
-    && chown -R aisix:aisix /etc/aisix /var/lib/aisix
+    && mkdir -p /etc/aisix/tls /var/lib/aisix /var/lib/aisix-spool \
+    && chown -R aisix:aisix /etc/aisix /var/lib/aisix /var/lib/aisix-spool \
+    && chmod 0700 /var/lib/aisix-spool
 
 # Install the binary and grant CAP_NET_BIND_SERVICE as a file
 # capability so the non-root user can bind privileged ports (e.g.
