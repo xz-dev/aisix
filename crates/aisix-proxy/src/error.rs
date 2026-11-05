@@ -371,6 +371,12 @@ pub enum ProxyError {
     /// `error.code`, limit and hop.
     #[error("{0}")]
     Capacity(crate::capacity::CapacityError),
+    /// An upstream error relayed with its status, headers and body
+    /// unchanged: a provider 413 or an inner hop refusal
+    /// ([`crate::capacity::relays_unchanged`]). Request-scoped, so it is
+    /// never retried, failed over or counted toward cooldown.
+    #[error("upstream returned HTTP {}: {}", .0.status, .0.preview())]
+    UpstreamRelay(Box<UpstreamRelay>),
     #[error(transparent)]
     RateLimit(#[from] RateLimitError),
     /// A policy-layer rate-limit rejection carrying the offending
@@ -478,6 +484,51 @@ pub(crate) fn guardrail_block_frame_payload(
     .expect("an error envelope serializes")
 }
 
+/// The upstream answer [`ProxyError::UpstreamRelay`] carries.
+#[derive(Debug)]
+pub struct UpstreamRelay {
+    pub status: u16,
+    pub headers: axum::http::HeaderMap,
+    pub body: bytes::Bytes,
+}
+
+impl UpstreamRelay {
+    /// The body as text, capped like an `UpstreamStatus` message, for logs.
+    fn preview(&self) -> String {
+        let text = String::from_utf8_lossy(&self.body);
+        text.chars()
+            .take(aisix_gateway::MAX_UPSTREAM_ERROR_MESSAGE_BYTES)
+            .collect()
+    }
+
+    fn into_response(self) -> Response {
+        let mut response = Response::new(axum::body::Body::from(self.body));
+        *response.status_mut() =
+            StatusCode::from_u16(self.status).unwrap_or(StatusCode::BAD_GATEWAY);
+        let headers = response.headers_mut();
+        for (name, value) in &self.headers {
+            // Hop-by-hop headers describe the upstream connection, and the
+            // length is the relayed body's own.
+            if matches!(
+                name.as_str(),
+                "transfer-encoding"
+                    | "connection"
+                    | "keep-alive"
+                    | "proxy-authenticate"
+                    | "proxy-authorization"
+                    | "te"
+                    | "trailer"
+                    | "upgrade"
+                    | "content-length"
+            ) {
+                continue;
+            }
+            headers.append(name.clone(), value.clone());
+        }
+        response
+    }
+}
+
 impl ProxyError {
     pub fn status(&self) -> StatusCode {
         match self {
@@ -527,6 +578,9 @@ impl ProxyError {
             ProxyError::Capacity(c) => {
                 StatusCode::from_u16(c.status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE)
             }
+            ProxyError::UpstreamRelay(r) => {
+                StatusCode::from_u16(r.status).unwrap_or(StatusCode::BAD_GATEWAY)
+            }
             ProxyError::RateLimit(_) => StatusCode::TOO_MANY_REQUESTS,
             ProxyError::PolicyRateLimit { .. } => StatusCode::TOO_MANY_REQUESTS,
             ProxyError::Bridge(b) => {
@@ -574,6 +628,7 @@ impl ProxyError {
             ProxyError::RequestTooLarge { .. } => "invalid_request_error",
             ProxyError::Capacity(c) if c.status == 413 => "invalid_request_error",
             ProxyError::Capacity(_) => "api_error",
+            ProxyError::UpstreamRelay(_) => "upstream_error",
             ProxyError::ProviderUnavailable => "provider_unavailable",
             // A gateway-side dependency failed, like `JwksUnavailable`;
             // `error.code` carries the distinction.
@@ -957,6 +1012,9 @@ fn mcp_user_oauth_message(failure: &aisix_mcp::UserOAuthFailure, server: &str) -
 
 impl IntoResponse for ProxyError {
     fn into_response(self) -> Response {
+        if let ProxyError::UpstreamRelay(relay) = self {
+            return relay.into_response();
+        }
         let challenge = self.auth_challenge();
         let status = self.status();
         let retry_after = self.retry_after_secs();
@@ -1095,6 +1153,9 @@ impl ProxyError {
     /// and upstream-message logic so the two envelope
     /// renderers can't drift on those rules.
     pub fn into_anthropic_response(self) -> Response {
+        if let ProxyError::UpstreamRelay(relay) = self {
+            return relay.into_response();
+        }
         let status = self.status();
         let retry_after = self.retry_after_secs();
         let rate_limit_detail = self.rate_limit_detail();

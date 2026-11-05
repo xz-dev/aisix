@@ -301,6 +301,8 @@ impl AttemptInfo {
 pub(crate) fn error_class(err: &ProxyError) -> &'static str {
     match err {
         ProxyError::Bridge(be) => routing_error_class(be),
+        // The upstream's own status answer, like `UpstreamStatus`.
+        ProxyError::UpstreamRelay(_) => "upstream_status",
         // Its `error.type` is the generic `api_error`, which would hide
         // the failure among every other gateway-side fault.
         ProxyError::SemanticDecisionFailed { .. } => "semantic_decision_failed",
@@ -591,7 +593,7 @@ pub(crate) fn relayed_failure(status: u16, body: &[u8]) -> (&'static str, String
 pub(crate) fn attempt_reached_upstream(err: &ProxyError) -> bool {
     match err {
         ProxyError::Bridge(be) => be.reached_upstream(),
-        ProxyError::ContentFiltered { .. } => true,
+        ProxyError::ContentFiltered { .. } | ProxyError::UpstreamRelay(_) => true,
         ProxyError::MissingAuth(_)
         | ProxyError::MissingRouteAuthHeader(_)
         | ProxyError::InvalidApiKey

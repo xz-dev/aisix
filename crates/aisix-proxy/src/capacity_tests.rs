@@ -172,3 +172,39 @@ async fn lease_refuses_bad_missing_and_released_tickets() {
     let err = waiting.await.unwrap().unwrap_err();
     assert!(err.message.contains("already released"), "{err}");
 }
+
+#[test]
+fn relays_unchanged_covers_413_and_inner_hop_errors_only() {
+    let inner = |code: &str, hop: &str| {
+        serde_json::json!({"error": {"message": "m", "type": "server_error", "code": code, "hop": hop}})
+            .to_string()
+    };
+    assert!(relays_unchanged(413, b"<html>too large</html>"));
+    for code in [
+        "request_too_large",
+        "insufficient_storage",
+        "insufficient_memory",
+        "capacity_busy",
+        "capacity_ticket_missing",
+        "capacity_ticket_invalid",
+    ] {
+        assert!(
+            relays_unchanged(503, inner(code, "cpa").as_bytes()),
+            "{code}"
+        );
+    }
+    // No hop, an empty hop or another code: today's handling.
+    assert!(!relays_unchanged(
+        503,
+        inner("insufficient_memory", "").as_bytes()
+    ));
+    assert!(!relays_unchanged(
+        503,
+        br#"{"error":{"message":"busy","code":"insufficient_memory"}}"#
+    ));
+    assert!(!relays_unchanged(
+        503,
+        inner("server_overloaded", "cpa").as_bytes()
+    ));
+    assert!(!relays_unchanged(503, b"upstream down"));
+}
