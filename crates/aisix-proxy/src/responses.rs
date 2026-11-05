@@ -3207,11 +3207,15 @@ struct PassthroughEnd {
     error_seen: bool,
     /// A frame over the buffer cap went out unparsed and its `event:` line
     /// did not name it: whether the stream finished is unknown, so nothing
-    /// is synthesized.
+    /// is synthesized. A later parsed frame clears it: the oversized one
+    /// was not the last.
     unknown: bool,
     /// Bytes of a frame whose terminator has not been sent yet are on the
     /// wire (the cap released them).
     open_frame: bool,
+    /// The `event:` kind of the open released frame. It counts only once
+    /// the upstream terminates that frame: a cut-off terminal is none.
+    pending_kind: Option<String>,
     /// Events whose JSON parsed; tells whether a final tail frame did.
     parsed: u64,
     last_seq: Option<u64>,
@@ -3236,6 +3240,7 @@ impl PassthroughEnd {
     /// Feed one parsed upstream event.
     fn observe(&mut self, json: &Value) {
         self.parsed += 1;
+        self.unknown = false;
         if let Some(seq) = json.get("sequence_number").and_then(Value::as_u64) {
             self.last_seq = Some(seq);
         }
@@ -3254,11 +3259,20 @@ impl PassthroughEnd {
                 .rposition(|&b| b == b'\n' || b == b'\r')
                 .map_or(&[][..], |i| &head[..=i]);
             match aisix_gateway::sse::parse_frame(complete).event {
-                Some(ev) => self.observe_kind(&String::from_utf8_lossy(ev)),
+                Some(ev) => self.pending_kind = Some(String::from_utf8_lossy(ev).into_owned()),
                 None => self.unknown = true,
             }
         }
         self.open_frame = true;
+    }
+
+    /// The upstream's terminator closed the open released frame: its kind
+    /// now counts.
+    fn close_open_frame(&mut self) {
+        self.open_frame = false;
+        if let Some(kind) = self.pending_kind.take() {
+            self.observe_kind(&kind);
+        }
     }
 
     /// Whether the stream needs a synthesized close.
@@ -3341,7 +3355,7 @@ fn drain_responses_sse_frames(
             None => out.extend_from_slice(forwarded),
         }
         // This frame's terminator closes any frame the cap released open.
-        stream_end.open_frame = false;
+        stream_end.close_open_frame();
         // Whole payload, not the first `data:` line (#1100): a frame whose
         // JSON is written over several `data:` lines parses only once they
         // are joined. Reading one line at a time leaves the terminal
@@ -3791,6 +3805,10 @@ where
             let pad: &[u8] = if buf.ends_with(b"\n") { b"\n" } else { b"\n\n" };
             buf.extend_from_slice(pad);
             let (parsed_before, was_open) = (end.parsed, end.open_frame);
+            // The pad is ours, not the upstream's terminator: an open
+            // released frame ending at EOF may be cut off, so its kind does
+            // not count.
+            end.pending_kind = None;
             let mut drained: Vec<u8> = Vec::new();
             let (usage_acc, capture) = guard.parts();
             drain_responses_sse_frames(
@@ -8405,6 +8423,54 @@ event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\
             .map(|d| serde_json::from_str::<Value>(d).unwrap()["type"].clone())
             .collect();
         assert_eq!(types, ["error", "response.failed"]);
+        assert_failed_close(&wire, saw_err, failure);
+    }
+
+    /// rv2 n1: an oversized `response.completed` cut off before its
+    /// terminator is not a terminal. Its kind stays pending until the
+    /// upstream ends the frame, so a clean EOF or a read error inside it
+    /// still gets the close.
+    #[tokio::test]
+    async fn oversized_terminal_cut_before_its_end_is_failed() {
+        let frame = oversized(true, "response.completed");
+        let body = [HEAD, &frame[..frame.len() - 100]].concat();
+        let (wire, saw_err, failure) = relay(futures::stream::iter(chunks(&body, 65536))).await;
+        assert_eq!(
+            last_event_type(&wire),
+            "response.failed",
+            "tail: {}",
+            &wire[wire.len() - 300..]
+        );
+        assert_failed_close(&wire, saw_err, failure);
+
+        static CUT: std::sync::LazyLock<Vec<u8>> = std::sync::LazyLock::new(|| {
+            let frame = oversized(true, "response.completed");
+            [HEAD, &frame[..frame.len() - 100]].concat()
+        });
+        let (wire, saw_err, failure) = relay(cut_upstream(CUT.as_slice(), false).await).await;
+        assert_eq!(
+            last_event_type(&wire),
+            "response.failed",
+            "tail: {}",
+            &wire[wire.len() - 300..]
+        );
+        assert_failed_close(&wire, saw_err, failure);
+    }
+
+    /// rv2 n2: a parsed frame after an oversized frame of unknown kind
+    /// proves that frame was not the last: an EOF then gets the close.
+    #[tokio::test]
+    async fn parsed_frame_after_unknown_oversized_frame_clears_unknown() {
+        let delta3 = b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":2,\"delta\":\"!\"}\n\n";
+        let body = [
+            HEAD,
+            &oversized(false, "response.output_text.delta"),
+            delta3,
+        ]
+        .concat();
+        let (wire, saw_err, failure) = relay(futures::stream::iter(chunks(&body, 65536))).await;
+        assert!(wire.starts_with(std::str::from_utf8(&body).unwrap()));
+        assert_well_formed(&wire);
         assert_failed_close(&wire, saw_err, failure);
     }
 }
