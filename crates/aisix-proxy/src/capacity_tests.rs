@@ -75,18 +75,67 @@ fn concurrent_charges_stay_under_the_margin() {
 
 fn ledger_with(id: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join(id), b"ticket").unwrap();
+    std::fs::write(dir.path().join(ticket_name(id)), b"ticket").unwrap();
     dir
 }
 
 const ID: &str = "0123456789abcdef0123456789abcdef";
+
+fn ticket_name(id: &str) -> String {
+    format!("{id}{TICKET_SUFFIX}")
+}
+
+#[tokio::test]
+async fn lease_opens_the_dot_ticket_file() {
+    let ledger = tempfile::tempdir().unwrap();
+    std::fs::write(ledger.path().join(ID), b"ticket").unwrap();
+    let err = take_lease(ledger.path(), ID).await.unwrap_err();
+    assert_eq!(err.code, "capacity_ticket_invalid", "bare-id file leased");
+    std::fs::write(ledger.path().join(ticket_name(ID)), b"ticket").unwrap();
+    let lease = take_lease(ledger.path(), ID).await.unwrap();
+    assert_eq!(lease.id, ID);
+}
+
+/// A malformed or path-like id is refused before any path is built, even
+/// when the traversal target exists.
+#[tokio::test]
+async fn lease_refuses_malformed_and_traversal_ids() {
+    let root = tempfile::tempdir().unwrap();
+    let ledger = root.path().join("ledger");
+    std::fs::create_dir(&ledger).unwrap();
+    // Targets of the "../" ids below.
+    for name in ["x", &ID[..29]] {
+        std::fs::write(root.path().join(ticket_name(name)), b"ticket").unwrap();
+    }
+    let traversal = format!("../{}", &ID[..29]);
+    let long = format!("{ID}0");
+    let slash = format!("{}/x", &ID[..30]);
+    let nul = format!("{}\0", &ID[..31]);
+    let upper = ID.to_uppercase();
+    for bad in [
+        "../x",
+        traversal.as_str(),
+        &ID[..31],
+        long.as_str(),
+        upper.as_str(),
+        slash.as_str(),
+        nul.as_str(),
+    ] {
+        let err = take_lease(&ledger, bad).await.unwrap_err();
+        assert_eq!(
+            (err.status, err.code),
+            (503, "capacity_ticket_invalid"),
+            "{bad:?}"
+        );
+    }
+}
 
 #[tokio::test]
 async fn lease_holds_a_shared_lock_until_dropped() {
     let ledger = ledger_with(ID);
     let lease = take_lease(ledger.path(), ID).await.unwrap();
     assert_eq!(lease.id, ID);
-    let keeper = std::fs::File::open(ledger.path().join(ID)).unwrap();
+    let keeper = std::fs::File::open(ledger.path().join(ticket_name(ID))).unwrap();
     let ex = rustix::fs::FlockOperation::NonBlockingLockExclusive;
     assert!(
         rustix::fs::flock(&keeper, ex).is_err(),
@@ -109,7 +158,7 @@ async fn lease_refuses_bad_missing_and_released_tickets() {
 
     // Keeper's release waiter holds the exclusive lock, deletes the
     // ticket and closes: the blocked lease then finds no link.
-    let keeper = std::fs::File::open(ledger.path().join(ID)).unwrap();
+    let keeper = std::fs::File::open(ledger.path().join(ticket_name(ID))).unwrap();
     rustix::fs::flock(&keeper, rustix::fs::FlockOperation::LockExclusive).unwrap();
     let path = ledger.path().to_path_buf();
     let waiting = tokio::spawn(async move { take_lease(&path, ID).await });
@@ -118,7 +167,7 @@ async fn lease_refuses_bad_missing_and_released_tickets() {
         !waiting.is_finished(),
         "the lease blocks on the kernel lock"
     );
-    std::fs::remove_file(ledger.path().join(ID)).unwrap();
+    std::fs::remove_file(ledger.path().join(ticket_name(ID))).unwrap();
     drop(keeper);
     let err = waiting.await.unwrap().unwrap_err();
     assert!(err.message.contains("already released"), "{err}");
