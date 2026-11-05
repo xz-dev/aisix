@@ -158,6 +158,11 @@ impl Tokenizer {
         &self.nonce
     }
 
+    /// The spool while ingest runs, for the caller to drain between pieces.
+    pub(crate) fn spool_mut(&mut self) -> Option<&mut SpoolFile> {
+        self.spool.as_mut()
+    }
+
     /// The spool, once ingest is finished; `None` when nothing was spooled.
     pub(crate) fn take_spool(&mut self) -> Option<SpoolFile> {
         self.spool.take()
@@ -446,7 +451,7 @@ impl Tokenizer {
             *escaped += add;
         }
         let spool = self.spool.as_mut().expect("spooled string without a spool");
-        spool.append(&data[..valid])?;
+        spool.append(&data[..valid]);
         self.utf8_carry = data.split_off(valid);
         self.decoded = data;
         self.decoded.clear();
@@ -482,9 +487,6 @@ impl Tokenizer {
             }
             Str::Spooled { .. } => return Err(IngestError::Invalid),
             Str::Out | Str::Copy { .. } => {}
-        }
-        if let Some(spool) = self.spool.as_mut() {
-            spool.finish()?;
         }
         let nonce = self.nonce.as_bytes();
         let seen = self

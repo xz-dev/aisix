@@ -94,31 +94,48 @@ impl BlobStore {
         Ok(buf)
     }
 
-    /// Put every blob back into `body`, for a fallback path that needs the
-    /// whole request in memory.
-    pub(crate) fn rehydrate(self: &Arc<Self>, body: &mut Value) -> Result<(), CapacityError> {
-        match body {
+    /// Call `f` on each string of `body` that is one of this store's
+    /// markers, in document order.
+    fn each_marker(&self, v: &mut Value, f: &mut dyn FnMut(&mut String, Blob)) {
+        match v {
             Value::String(s) if s.len() == MARKER_LEN => {
                 if let Some(blob) = self.blob_of(s.as_bytes()) {
-                    let bytes = self
-                        .read(blob, 0, blob.len as usize)
-                        .map_err(|e| CapacityError::spool_io(&e))?;
-                    // Validated as UTF-8 when it was spooled.
-                    *s = String::from_utf8(bytes)
-                        .map_err(|_| CapacityError::marker("blob is not UTF-8"))?;
+                    f(s, blob);
                 }
             }
-            Value::Array(items) => {
-                for v in items {
-                    self.rehydrate(v)?;
-                }
-            }
-            Value::Object(map) => {
-                for v in map.values_mut() {
-                    self.rehydrate(v)?;
-                }
-            }
+            Value::Array(items) => items.iter_mut().for_each(|v| self.each_marker(v, f)),
+            Value::Object(map) => map.values_mut().for_each(|v| self.each_marker(v, f)),
             _ => {}
+        }
+    }
+
+    /// Put every blob back into `body`, for a fallback path that needs the
+    /// whole request in memory. The spool reads run on the blocking pool.
+    pub(crate) async fn rehydrate(self: &Arc<Self>, body: &mut Value) -> Result<(), CapacityError> {
+        let mut blobs = Vec::new();
+        self.each_marker(body, &mut |_, blob| blobs.push(blob));
+        if blobs.is_empty() {
+            return Ok(());
+        }
+        let store = self.clone();
+        let read = tokio::task::spawn_blocking(move || {
+            blobs
+                .into_iter()
+                .map(|blob| store.read(blob, 0, blob.len as usize))
+                .collect::<std::io::Result<Vec<_>>>()
+        })
+        .await
+        .map_err(|e| CapacityError::spool_io(&std::io::Error::other(e)))?
+        .map_err(|e| CapacityError::spool_io(&e))?;
+        let mut read = read.into_iter();
+        let mut bad = false;
+        // Validated as UTF-8 when it was spooled.
+        self.each_marker(body, &mut |s, _| match read.next().map(String::from_utf8) {
+            Some(Ok(text)) => *s = text,
+            _ => bad = true,
+        });
+        if bad {
+            return Err(CapacityError::marker("blob is not UTF-8"));
         }
         Ok(())
     }
