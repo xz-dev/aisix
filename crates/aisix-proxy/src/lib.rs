@@ -7591,6 +7591,145 @@ data: [DONE]\n\n";
         assert!(events.iter().all(|e| e.status_code == 502));
     }
 
+    /// large-request-capacity D9: `body` from the primary of a two-target
+    /// group (retries 2, cooldown on) reaches the caller unchanged on two
+    /// requests in a row: one attempt each, never the secondary, no cooldown.
+    async fn assert_responses_relay_unchanged(status: u16, body: &str) {
+        let primary = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(status)
+                    .insert_header("x-upstream-marker", "kept")
+                    .set_body_raw(body.to_string(), "application/json"),
+            )
+            .expect(2)
+            .mount(&primary)
+            .await;
+        let secondary = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&secondary)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(pk_entry_with_id("pk-a", &primary.uri()));
+        snap.provider_keys
+            .insert(pk_entry_with_id("pk-b", &secondary.uri()));
+        let mut first = model_entry_with_id("m-a", "primary", "pk-a");
+        first.value.cooldown = Some(aisix_core::CooldownConfig {
+            enabled: Some(true),
+            trigger_statuses: Some(vec![413, 503, 507]),
+            ..Default::default()
+        });
+        snap.models.insert(first);
+        snap.models
+            .insert(model_entry_with_id("m-b", "secondary", "pk-b"));
+        snap.models.insert(routing_entry(
+            "smart",
+            "failover",
+            &["primary", "secondary"],
+            Some(2),
+            Some(1),
+            None,
+        ));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["smart"]));
+        let app = build_router(build_state(snap, hub));
+
+        for _ in 0..2 {
+            let req = Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"smart","input":"hi"}"#))
+                .unwrap();
+            let resp = run(app.clone(), req).await;
+            assert_eq!(resp.status().as_u16(), status);
+            assert_eq!(resp.headers()["x-upstream-marker"], "kept");
+            assert_eq!(resp.headers()["content-type"], "application/json");
+            let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+            assert_eq!(std::str::from_utf8(&bytes).unwrap(), body);
+        }
+        // The mocks' `.expect` counts are checked on drop.
+    }
+
+    #[tokio::test]
+    async fn responses_relays_inner_503_with_hop_unchanged() {
+        assert_responses_relay_unchanged(
+            503,
+            r#"{"error":{"message":"cpa: memory charge of 9437184 bytes refused","type":"server_error","code":"insufficient_memory","hop":"cpa","limit_bytes":42991616}}"#,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn responses_relays_inner_507_with_hop_unchanged() {
+        assert_responses_relay_unchanged(
+            507,
+            r#"{"error":{"message":"cpa: spool write refused","type":"server_error","code":"insufficient_storage","hop":"cpa","limit_bytes":1073741824}}"#,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn responses_relays_provider_413_unchanged() {
+        assert_responses_relay_unchanged(
+            413,
+            r#"{"error":{"code":"request_too_large","message":"mock provider: request entity too large","type":"invalid_request_error"}}"#,
+        )
+        .await;
+    }
+
+    /// A 503 without `hop` is an ordinary upstream fault: retried on the
+    /// same target (retries 2 → 3 attempts), then the generic 502 envelope.
+    #[tokio::test]
+    async fn responses_plain_503_without_hop_keeps_retry_handling() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(503).set_body_raw(
+                r#"{"error":{"message":"busy","type":"server_error","code":"insufficient_memory"}}"#,
+                "application/json",
+            ))
+            .expect(3)
+            .mount(&upstream)
+            .await;
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(pk_entry_with_id("pk-a", &upstream.uri()));
+        snap.models
+            .insert(model_entry_with_id("m-a", "primary", "pk-a"));
+        snap.models.insert(routing_entry(
+            "smart",
+            "failover",
+            &["primary"],
+            Some(2),
+            None,
+            None,
+        ));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["smart"]));
+        let app = build_router(build_state(snap, hub));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model":"smart","input":"hi"}"#))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "upstream_error");
+    }
+
     /// AISIX-Cloud#790: a plain direct-model request (no routing group)
     /// records the client-sent name in `requested_model` and keeps the
     /// direct model's own id in `model_id` — on both the OpenAI and the

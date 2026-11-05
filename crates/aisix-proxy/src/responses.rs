@@ -1541,11 +1541,24 @@ async fn responses_to_target(
     if !status.is_success() {
         let status_u16 = status.as_u16();
         let retry_after = aisix_gateway::parse_retry_after(upstream_resp.headers());
-        let message =
-            crate::stream_timeout::body_within(body_until, send_started, upstream_resp.text())
+        let headers = upstream_resp.headers().clone();
+        let body =
+            crate::stream_timeout::body_within(body_until, send_started, upstream_resp.bytes())
                 .await
                 .map_err(ProxyError::Bridge)?
                 .unwrap_or_default();
+        // A provider 413 or an inner hop refusal goes back unchanged, with no
+        // retry, failover or cooldown (D9).
+        if crate::capacity::relays_unchanged(status_u16, &body) {
+            return Err(ProxyError::UpstreamRelay(Box::new(
+                crate::error::UpstreamRelay {
+                    status: status_u16,
+                    headers,
+                    body,
+                },
+            )));
+        }
+        let message = String::from_utf8_lossy(&body);
         let err = aisix_gateway::BridgeError::upstream_status_with_retry_after(
             status_u16,
             message.chars().take(1024).collect::<String>(),

@@ -301,6 +301,8 @@ impl AttemptInfo {
 pub(crate) fn error_class(err: &ProxyError) -> &'static str {
     match err {
         ProxyError::Bridge(be) => routing_error_class(be),
+        // The upstream's own status answer, like `UpstreamStatus`.
+        ProxyError::UpstreamRelay(_) => "upstream_status",
         // Its `error.type` is the generic `api_error`, which would hide
         // the failure among every other gateway-side fault.
         ProxyError::SemanticDecisionFailed { .. } => "semantic_decision_failed",
@@ -491,6 +493,7 @@ pub(crate) fn access_log_error(err: &ProxyError) -> (&'static str, String) {
 pub(crate) fn attempt_error_from_proxy(err: &ProxyError) -> (String, String) {
     let message = match err {
         ProxyError::Bridge(be) => attempt_error_message(be),
+        ProxyError::UpstreamRelay(_) => sanitize_error_message(&err.to_string()),
         ProxyError::ContentFiltered { .. } => gateway_error_message(err),
         _ => String::new(),
     };
@@ -545,9 +548,10 @@ pub(crate) fn gateway_error_message(err: &ProxyError) -> String {
         // `InvalidRequest` can quote the request body (a serde message
         // names the offending value), a video id is whatever the caller
         // sent, and a bridge error carries upstream response text.
-        ProxyError::InvalidRequest(_) | ProxyError::VideoNotFound(_) | ProxyError::Bridge(_) => {
-            false
-        }
+        ProxyError::InvalidRequest(_)
+        | ProxyError::VideoNotFound(_)
+        | ProxyError::Bridge(_)
+        | ProxyError::UpstreamRelay(_) => false,
     };
     if gateway_text {
         access_log_error(err).1
@@ -574,7 +578,7 @@ pub(crate) fn gateway_error_message(err: &ProxyError) -> String {
 pub(crate) fn attempt_reached_upstream(err: &ProxyError) -> bool {
     match err {
         ProxyError::Bridge(be) => be.reached_upstream(),
-        ProxyError::ContentFiltered { .. } => true,
+        ProxyError::ContentFiltered { .. } | ProxyError::UpstreamRelay(_) => true,
         ProxyError::MissingAuth(_)
         | ProxyError::MissingRouteAuthHeader(_)
         | ProxyError::InvalidApiKey
