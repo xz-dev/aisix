@@ -16,16 +16,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          fetch-depth: 0
       - name: Check approved head
         id: meta
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "$APPROVED_SHA"
+          git merge-base --is-ancestor "$APPROVED_SHA" HEAD
+          test "$(git diff --name-only "$APPROVED_SHA" HEAD)" = .github/workflows/ghcr-ci.yml
           echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
           echo "tag=ci-${APPROVED_SHA:0:10}" >> "$GITHUB_OUTPUT"
           echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-protoc
+      - name: Build the aisix binary (Dockerfile packages bin/aisix-<arch>)
+        shell: bash
+        run: |
+          set -euo pipefail
+          AISIX_BUILD_SHA="${APPROVED_SHA:0:7}" AISIX_BUILD_VERSION="" scripts/build-image-binary.sh thin
+          ls -l bin/
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
