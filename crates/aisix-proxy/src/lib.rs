@@ -7960,6 +7960,236 @@ data: [DONE]\n\n";
         assert_relay_unchanged(RELAY_TRANSLATED, 413, PROVIDER_413).await;
     }
 
+    /// A valid provider 413 envelope of `len` bytes, longer than the 64 KiB
+    /// error-parsing cap when `len` says so.
+    fn large_provider_413(len: usize) -> String {
+        let head =
+            r#"{"error":{"code":"request_too_large","type":"invalid_request_error","message":""#;
+        let tail = r#""}}"#;
+        let body = format!("{head}{}{tail}", "x".repeat(len - head.len() - tail.len()));
+        assert_eq!(body.len(), len);
+        body
+    }
+
+    /// A two-target group whose primary is `primary_uri`: retries 2, 413 in
+    /// both `fallback_on_statuses` and the primary's cooldown triggers, so
+    /// only D9's request scoping keeps a 413 to one attempt on the primary.
+    fn relay_413_app(route: RelayRoute, primary_uri: &str, secondary_uri: &str) -> axum::Router {
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(relay_pk("pk-a", primary_uri, route.provider));
+        snap.provider_keys
+            .insert(relay_pk("pk-b", secondary_uri, route.provider));
+        let mut first = relay_model("m-a", "primary", "pk-a", route.provider);
+        first.cooldown = Some(aisix_core::CooldownConfig {
+            enabled: Some(true),
+            trigger_statuses: Some(vec![413]),
+            ..Default::default()
+        });
+        snap.models.insert(ResourceEntry::new("m-a", first, 1));
+        snap.models.insert(ResourceEntry::new(
+            "m-b",
+            relay_model("m-b", "secondary", "pk-b", route.provider),
+            1,
+        ));
+        let group: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "smart",
+            "routing": {
+                "strategy": "failover",
+                "targets": [{"model": "primary"}, {"model": "secondary"}],
+                "retries": 2,
+                "fallback_on_statuses": [413],
+            }
+        }))
+        .unwrap();
+        snap.models
+            .insert(ResourceEntry::new("router-smart", group, 1));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["smart"]));
+        build_router(build_state(snap, relay_hub()))
+    }
+
+    /// A secondary that must never be reached.
+    async fn unreached_secondary() -> MockServer {
+        let secondary = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&secondary)
+            .await;
+        secondary
+    }
+
+    /// The gateway's request-scoped answer to a 413 whose body could not be
+    /// relayed whole: the upstream status and marker header, and a complete
+    /// JSON `request_too_large` envelope, never a fragment.
+    async fn assert_unrelayable_413(resp: axum::response::Response, route: RelayRoute) {
+        assert_eq!(resp.status().as_u16(), 413, "{}", route.uri);
+        assert_eq!(resp.headers()["x-upstream-marker"], "kept");
+        assert_eq!(resp.headers()["content-type"], "application/json");
+        let bytes = to_bytes(resp.into_body(), 2 * 1024 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|e| panic!("{}: not a whole JSON body ({e})", route.uri));
+        assert_eq!(v["error"]["code"], "request_too_large", "{v}");
+        assert_eq!(v["error"]["type"], "invalid_request_error", "{v}");
+    }
+
+    /// Review regression (D9 body identity): a provider 413 longer than the
+    /// 64 KiB parsing cap reaches the caller whole, not as a 65,536-byte
+    /// prefix, with one attempt per request and no failover.
+    async fn assert_large_413_relayed_whole(route: RelayRoute) {
+        let body = large_provider_413(70_026);
+        let primary = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path(route.upstream_path))
+            .respond_with(
+                ResponseTemplate::new(413)
+                    .insert_header("x-upstream-marker", "kept")
+                    .set_body_raw(body.clone(), "application/json"),
+            )
+            .expect(2)
+            .mount(&primary)
+            .await;
+        let secondary = unreached_secondary().await;
+        let app = relay_413_app(route, &primary.uri(), &secondary.uri());
+        for _ in 0..2 {
+            let resp = run(app.clone(), relay_request(route)).await;
+            assert_eq!(resp.status().as_u16(), 413, "{}", route.uri);
+            assert_eq!(resp.headers()["x-upstream-marker"], "kept");
+            let bytes = to_bytes(resp.into_body(), 2 * 1024 * 1024).await.unwrap();
+            assert_eq!(bytes.len(), body.len(), "{}", route.uri);
+            assert_eq!(std::str::from_utf8(&bytes).unwrap(), body, "{}", route.uri);
+        }
+    }
+
+    /// A provider 413 longer than the relay bound gets the request-scoped
+    /// envelope: one attempt per request, no failover.
+    async fn assert_oversized_413_request_scoped(route: RelayRoute) {
+        let body = large_provider_413(aisix_gateway::MAX_UPSTREAM_RELAY_BODY_BYTES + 4096);
+        let primary = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path(route.upstream_path))
+            .respond_with(
+                ResponseTemplate::new(413)
+                    .insert_header("x-upstream-marker", "kept")
+                    .set_body_raw(body, "application/json"),
+            )
+            .expect(2)
+            .mount(&primary)
+            .await;
+        let secondary = unreached_secondary().await;
+        let app = relay_413_app(route, &primary.uri(), &secondary.uri());
+        for _ in 0..2 {
+            let resp = run(app.clone(), relay_request(route)).await;
+            assert_unrelayable_413(resp, route).await;
+        }
+    }
+
+    /// An upstream answering every request with a 413 head that declares 100
+    /// more body bytes than it sends before closing, so reading the body
+    /// fails after the status is known. Counts the requests it answered.
+    async fn interrupted_413_upstream() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let counter = calls.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 8192];
+                    loop {
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                            continue;
+                        };
+                        let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                        let body = &buf[end + 4..];
+                        let complete = if head.contains("transfer-encoding: chunked") {
+                            body.ends_with(b"0\r\n\r\n")
+                        } else {
+                            let len = head
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:"))
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                                .unwrap_or(0);
+                            body.len() >= len
+                        };
+                        if complete {
+                            break;
+                        }
+                    }
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 413 Payload Too Large\r\n\
+                              content-type: text/html\r\n\
+                              content-length: 107\r\n\
+                              x-upstream-marker: kept\r\n\r\npartial",
+                        )
+                        .await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        (format!("http://{addr}"), calls)
+    }
+
+    /// Review regression (D9 request scoping): a 413 whose body read fails is
+    /// still request-scoped, not an ordinary retryable upstream status: one
+    /// attempt per request even with retries 2 and 413 in
+    /// `fallback_on_statuses`, never the secondary.
+    async fn assert_interrupted_413_request_scoped(route: RelayRoute) {
+        let (primary, calls) = interrupted_413_upstream().await;
+        let secondary = unreached_secondary().await;
+        let app = relay_413_app(route, &primary, &secondary.uri());
+        for request in 1..=2 {
+            let resp = run(app.clone(), relay_request(route)).await;
+            assert_unrelayable_413(resp, route).await;
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                request,
+                "{}: a known 413 was retried",
+                route.uri
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_relays_a_provider_413_longer_than_the_parse_cap_whole() {
+        assert_large_413_relayed_whole(RELAY_RESPONSES).await;
+    }
+
+    #[tokio::test]
+    async fn chat_relays_a_provider_413_longer_than_the_parse_cap_whole() {
+        assert_large_413_relayed_whole(RELAY_CHAT).await;
+    }
+
+    #[tokio::test]
+    async fn responses_answers_a_provider_413_over_the_relay_bound_request_scoped() {
+        assert_oversized_413_request_scoped(RELAY_RESPONSES).await;
+    }
+
+    #[tokio::test]
+    async fn chat_answers_a_provider_413_over_the_relay_bound_request_scoped() {
+        assert_oversized_413_request_scoped(RELAY_CHAT).await;
+    }
+
+    #[tokio::test]
+    async fn responses_keeps_a_413_with_an_unreadable_body_request_scoped() {
+        assert_interrupted_413_request_scoped(RELAY_RESPONSES).await;
+    }
+
+    #[tokio::test]
+    async fn chat_keeps_a_413_with_an_unreadable_body_request_scoped() {
+        assert_interrupted_413_request_scoped(RELAY_CHAT).await;
+    }
+
     #[tokio::test]
     async fn translated_messages_plain_503_without_hop_keeps_retry_handling() {
         let v = assert_plain_503_keeps_retry_handling(RELAY_TRANSLATED).await;

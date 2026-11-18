@@ -1544,7 +1544,10 @@ async fn responses_to_target(
         // streaming one. A provider 413 or an inner hop refusal comes back as
         // `BridgeError::UpstreamRelay` (D9): relayed unchanged, never retried,
         // failed over or cooled down.
-        let err = crate::stream_timeout::body_within(
+        // A provider 413 stays request-scoped even when its body does not
+        // arrive in time.
+        let headers_413 = (status.as_u16() == 413).then(|| upstream_resp.headers().clone());
+        let err = match crate::stream_timeout::body_within(
             body_until,
             send_started,
             aisix_gateway::upstream_error_within(
@@ -1554,7 +1557,16 @@ async fn responses_to_target(
             ),
         )
         .await
-        .map_err(ProxyError::Bridge)?;
+        {
+            Ok(err) => err,
+            Err(timeout) => match &headers_413 {
+                Some(headers) => aisix_gateway::unrelayable_413(
+                    headers,
+                    "reading it did not finish within the request timeout",
+                ),
+                None => return Err(ProxyError::Bridge(timeout)),
+            },
+        };
         if let Some((ttl, reason)) = crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
         {
             state.runtime_status.mark_cooldown(model_id, ttl, reason);
