@@ -267,16 +267,10 @@ async fn mantle_count_tokens(
             .get("x-amzn-errortype")
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
-        let headers = resp.headers().clone();
-        let body =
-            aisix_gateway::read_body_capped(resp, aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES)
-                .await;
-        if body.read_error.is_none() {
-            if let Some(relay) =
-                aisix_gateway::upstream_relay(status.as_u16(), &headers, &body.bytes)
-            {
-                return Err(relay);
-            }
+        // A provider 413 or an inner hop refusal goes back unchanged (D9).
+        let (body, relay) = aisix_gateway::read_error_body_for_relay(resp).await;
+        if let Some(relay) = relay {
+            return Err(relay);
         }
         return Err(crate::errors::upstream_error(
             status.as_u16(),

@@ -322,17 +322,16 @@ async fn http_error(resp: reqwest::Response, started: Instant) -> BridgeError {
         .get("x-amzn-errortype")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let headers = resp.headers().clone();
-    let aisix_gateway::UpstreamErrorBody {
-        bytes: body,
-        read_error,
-    } = aisix_gateway::read_body_capped(resp, aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES).await;
-    // A provider 413 or an inner hop refusal goes back unchanged (D9); only
-    // a body that arrived whole is relayed, never a fragment.
-    if read_error.is_none() {
-        if let Some(relay) = aisix_gateway::upstream_relay(status, &headers, &body) {
-            return relay;
-        }
+    // A provider 413 or an inner hop refusal goes back unchanged (D9).
+    let (
+        aisix_gateway::UpstreamErrorBody {
+            bytes: body,
+            read_error,
+        },
+        relay,
+    ) = aisix_gateway::read_error_body_for_relay(resp).await;
+    if let Some(relay) = relay {
+        return relay;
     }
     let parsed: Option<Value> = serde_json::from_slice(&body).ok();
     let field = |v: &Value, k: &str| {

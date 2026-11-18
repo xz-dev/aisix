@@ -37,6 +37,12 @@ pub const MAX_UPSTREAM_ERROR_BODY_BYTES: usize = 64 * 1024;
 /// fallback shown to clients when parsing fails.
 pub const MAX_UPSTREAM_ERROR_MESSAGE_BYTES: usize = 1024;
 
+/// Maximum body a provider 413 is read up to so that it can be relayed whole
+/// (large-request-capacity D9). Parsing still sees at most
+/// [`MAX_UPSTREAM_ERROR_BODY_BYTES`]; a 413 whose body is longer than this, or
+/// whose body cannot be read, gets [`unrelayable_413`] instead of a fragment.
+pub const MAX_UPSTREAM_RELAY_BODY_BYTES: usize = 1024 * 1024;
+
 /// Which wire format the upstream that produced this error speaks. The
 /// envelope-rendering layer uses this together with [`UpstreamErrorView`]
 /// to decide whether the upstream `kind` / `code` can be forwarded
@@ -539,6 +545,81 @@ pub fn upstream_relay(
     })
 }
 
+/// The request-scoped answer to a provider 413 whose body cannot be relayed
+/// whole (D9): the upstream's status and headers, with the gateway's own
+/// `request_too_large` envelope as the body instead of a fragment. It is a
+/// [`BridgeError::UpstreamRelay`] like any relayed 413, so it is never
+/// retried, failed over or counted toward cooldown or health.
+pub fn unrelayable_413(headers: &http::HeaderMap, reason: &str) -> BridgeError {
+    let mut headers = headers.clone();
+    for name in [
+        http::header::CONTENT_TYPE,
+        http::header::CONTENT_LENGTH,
+        http::header::CONTENT_ENCODING,
+        http::header::TRANSFER_ENCODING,
+    ] {
+        headers.remove(name);
+    }
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    let body = serde_json::json!({
+        "error": {
+            "message": format!(
+                "upstream returned HTTP 413 (request too large); its error body was not \
+                 relayed: {reason}"
+            ),
+            "type": "invalid_request_error",
+            "code": "request_too_large",
+        }
+    });
+    BridgeError::UpstreamRelay(Box::new(UpstreamRelay {
+        status: 413,
+        headers,
+        body: bytes::Bytes::from(body.to_string()),
+    }))
+}
+
+/// Read a non-2xx upstream body and decide the D9 relay for it.
+///
+/// Returns the body for the caller's own error normalization, as
+/// [`read_body_capped`] would give it (at most
+/// [`MAX_UPSTREAM_ERROR_BODY_BYTES`]), and the relay when the answer reaches
+/// the caller unchanged. Only a body that arrived whole and within its bound
+/// is relayed: a provider 413 is read up to [`MAX_UPSTREAM_RELAY_BODY_BYTES`]
+/// and, cut or unreadable, still answers request-scoped through
+/// [`unrelayable_413`]; an inner hop refusal that did not arrive whole reads
+/// as an ordinary upstream error.
+pub async fn read_error_body_for_relay(
+    resp: reqwest::Response,
+) -> (UpstreamErrorBody, Option<BridgeError>) {
+    let status = resp.status().as_u16();
+    let headers = resp.headers().clone();
+    let limit = if status == 413 {
+        MAX_UPSTREAM_RELAY_BODY_BYTES
+    } else {
+        MAX_UPSTREAM_ERROR_BODY_BYTES
+    };
+    let (mut body, truncated) = read_body_capped_tracked(resp, limit).await;
+    let relay = match (&body.read_error, truncated) {
+        (None, false) => upstream_relay(status, &headers, &body.bytes),
+        (Some(err), _) if status == 413 => Some(unrelayable_413(
+            &headers,
+            &format!("reading it failed: {err}"),
+        )),
+        (None, true) if status == 413 => Some(unrelayable_413(
+            &headers,
+            &format!("it is longer than {MAX_UPSTREAM_RELAY_BODY_BYTES} bytes"),
+        )),
+        _ => None,
+    };
+    if body.bytes.len() > MAX_UPSTREAM_ERROR_BODY_BYTES {
+        body.bytes = body.bytes.slice(..MAX_UPSTREAM_ERROR_BODY_BYTES);
+    }
+    (body, relay)
+}
+
 impl BridgeError {
     /// Convenience constructor for synthesised upstream errors (tests,
     /// cooldown fixtures) where no real upstream envelope is involved.
@@ -654,11 +735,17 @@ pub async fn upstream_error_within<F: std::future::Future<Output = BridgeError>>
     };
     let status = resp.status().as_u16();
     let retry_after = parse_retry_after(resp.headers());
+    let headers = (status == 413).then(|| resp.headers().clone());
     tokio::time::timeout(d, read(resp))
         .await
         .unwrap_or_else(|_| {
             let reason = format!("timed out after {}ms", d.as_millis());
             crate::response_tap::warn_error_body_unread(status, &reason);
+            // A provider 413 stays request-scoped whether or not its body
+            // arrives (D9).
+            if let Some(headers) = &headers {
+                return unrelayable_413(headers, &format!("reading it {reason}"));
+            }
             BridgeError::upstream_status_with_retry_after(status, "", retry_after)
                 .with_body_read_error(Some(reason))
         })
@@ -677,14 +764,10 @@ pub async fn upstream_status_parsed_from_response(
 ) -> BridgeError {
     let status = resp.status().as_u16();
     let retry_after = parse_retry_after(resp.headers());
-    let headers = resp.headers().clone();
-    let body = read_body_capped(resp, MAX_UPSTREAM_ERROR_BODY_BYTES).await;
-    // A provider 413 or an inner hop refusal goes back unchanged (D9); only
-    // a body that arrived whole is relayed, never a fragment.
-    if body.read_error.is_none() {
-        if let Some(relay) = upstream_relay(status, &headers, &body.bytes) {
-            return relay;
-        }
+    // A provider 413 or an inner hop refusal goes back unchanged (D9).
+    let (body, relay) = read_error_body_for_relay(resp).await;
+    if let Some(relay) = relay {
+        return relay;
     }
     upstream_status_of_body(status, body.whole(), retry_after, wire, parse)
         .with_body_read_error(body.read_error)
@@ -750,17 +833,16 @@ pub async fn capture_upstream_error_http(
     parse: impl FnOnce(&[u8]) -> Option<UpstreamErrorView>,
 ) -> BridgeError {
     let retry_after = parse_retry_after(resp.headers());
-    let headers = resp.headers().clone();
-    let UpstreamErrorBody {
-        bytes: body,
-        read_error,
-    } = read_body_capped(resp, MAX_UPSTREAM_ERROR_BODY_BYTES).await;
-    // A provider 413 or an inner hop refusal goes back unchanged (D9); only
-    // a body that arrived whole is relayed, never a fragment.
-    if read_error.is_none() {
-        if let Some(relay) = upstream_relay(status.as_u16(), &headers, &body) {
-            return relay;
-        }
+    // A provider 413 or an inner hop refusal goes back unchanged (D9).
+    let (
+        UpstreamErrorBody {
+            bytes: body,
+            read_error,
+        },
+        relay,
+    ) = read_error_body_for_relay(resp).await;
+    if let Some(relay) = relay {
+        return relay;
     }
     // Parse the error envelope opportunistically, regardless of the
     // upstream's Content-Type (#543). OpenAI's 401 `invalid_api_key`
@@ -993,7 +1075,18 @@ impl UpstreamErrorBody {
 /// extracting only `kind` from the upstream envelope while suppressing
 /// the `message` for operator-taxonomy redaction).
 pub async fn read_body_capped(resp: reqwest::Response, limit: usize) -> UpstreamErrorBody {
+    read_body_capped_tracked(resp, limit).await.0
+}
+
+/// [`read_body_capped`], also saying whether bytes past `limit` were
+/// discarded: a cut body is not the upstream's body, so it is never relayed
+/// as one (D9).
+async fn read_body_capped_tracked(
+    resp: reqwest::Response,
+    limit: usize,
+) -> (UpstreamErrorBody, bool) {
     use futures::StreamExt;
+    let mut truncated = false;
     let status = resp.status().as_u16();
     let mut read_error = None;
     let mut buf = bytes::BytesMut::with_capacity(limit.min(16 * 1024));
@@ -1016,15 +1109,17 @@ pub async fn read_body_capped(resp: reqwest::Response, limit: usize) -> Upstream
             }
         };
         if buf.len() >= limit {
+            truncated |= !chunk.is_empty();
             continue;
         }
         let remaining = limit - buf.len();
         let take = chunk.len().min(remaining);
+        truncated |= take < chunk.len();
         buf.extend_from_slice(&chunk[..take]);
     }
     let bytes = buf.freeze();
     crate::response_tap::note_upstream_error_body(&bytes);
-    UpstreamErrorBody { bytes, read_error }
+    (UpstreamErrorBody { bytes, read_error }, truncated)
 }
 
 /// Content-Type token starts with `application/json` (RFC 7231 §3.1.1.1
@@ -1908,6 +2003,87 @@ mod tests {
     fn sample_model_resolves_to_openai() {
         let m = sample_model();
         assert_eq!(m.provider.as_deref(), Some("openai"));
+    }
+
+    fn error_response(status: u16, body: Vec<u8>) -> reqwest::Response {
+        reqwest::Response::from(
+            http::Response::builder()
+                .status(status)
+                .header("x-upstream-marker", "kept")
+                .header("content-type", "text/html")
+                .body(body)
+                .unwrap(),
+        )
+    }
+
+    fn relayed(err: Option<BridgeError>) -> Box<UpstreamRelay> {
+        match err {
+            Some(BridgeError::UpstreamRelay(r)) => r,
+            other => panic!("expected a relay, got {other:?}"),
+        }
+    }
+
+    /// D9 relays a provider 413 whole past the 64 KiB parsing cap, and the
+    /// caller's parse view stays capped.
+    #[tokio::test]
+    async fn a_413_past_the_parse_cap_is_relayed_whole() {
+        let body = vec![b'a'; MAX_UPSTREAM_ERROR_BODY_BYTES + 4_490];
+        let (parse, relay) = read_error_body_for_relay(error_response(413, body.clone())).await;
+        assert_eq!(parse.bytes.len(), MAX_UPSTREAM_ERROR_BODY_BYTES);
+        assert!(parse.read_error.is_none());
+        let relay = relayed(relay);
+        assert_eq!(relay.status, 413);
+        assert_eq!(relay.body.as_ref(), body.as_slice());
+        assert_eq!(relay.headers["x-upstream-marker"], "kept");
+    }
+
+    /// A 413 cut at the relay bound is never relayed as a fragment; it still
+    /// answers request-scoped with the gateway's own envelope.
+    #[tokio::test]
+    async fn a_413_past_the_relay_bound_gets_the_request_scoped_envelope() {
+        let body = vec![b'a'; MAX_UPSTREAM_RELAY_BODY_BYTES + 1];
+        let (_, relay) = read_error_body_for_relay(error_response(413, body)).await;
+        let relay = relayed(relay);
+        assert_eq!(relay.status, 413);
+        assert_eq!(relay.headers["x-upstream-marker"], "kept");
+        assert_eq!(relay.headers["content-type"], "application/json");
+        let v: serde_json::Value = serde_json::from_slice(&relay.body).unwrap();
+        assert_eq!(v["error"]["code"], "request_too_large");
+        let err = BridgeError::UpstreamRelay(relay);
+        assert_eq!(err.http_status(), 413);
+    }
+
+    /// An inner hop refusal that did not arrive whole is not relayed; its
+    /// prefix is not the upstream's answer.
+    #[tokio::test]
+    async fn a_cut_inner_hop_refusal_is_not_relayed() {
+        let pad = "x".repeat(MAX_UPSTREAM_ERROR_BODY_BYTES);
+        let body = format!(
+            r#"{{"error":{{"code":"insufficient_memory","hop":"cpa","message":"{pad}"}}}}"#
+        );
+        let (parse, relay) = read_error_body_for_relay(error_response(503, body.into())).await;
+        assert!(relay.is_none());
+        assert_eq!(parse.bytes.len(), MAX_UPSTREAM_ERROR_BODY_BYTES);
+    }
+
+    #[test]
+    fn the_unrelayable_413_envelope_replaces_body_headers_only() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-upstream-marker", "kept".parse().unwrap());
+        headers.insert("content-length", "107".parse().unwrap());
+        headers.insert("content-encoding", "gzip".parse().unwrap());
+        headers.insert("retry-after", "5".parse().unwrap());
+        let relay = relayed(Some(unrelayable_413(&headers, "reading it failed: reset")));
+        assert_eq!(relay.headers["x-upstream-marker"], "kept");
+        assert_eq!(relay.headers["retry-after"], "5");
+        assert!(relay.headers.get("content-length").is_none());
+        assert!(relay.headers.get("content-encoding").is_none());
+        assert_eq!(relay.headers["content-type"], "application/json");
+        let v: serde_json::Value = serde_json::from_slice(&relay.body).unwrap();
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("reading it failed: reset"));
     }
 
     #[test]
