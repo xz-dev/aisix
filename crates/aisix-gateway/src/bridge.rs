@@ -581,6 +581,43 @@ pub fn unrelayable_413(headers: &http::HeaderMap, reason: &str) -> BridgeError {
     }))
 }
 
+tokio::task_local! {
+    /// The headers of a provider 413 head [`read_error_body_for_relay`] saw
+    /// inside [`timeout_keeping_413`], so that a deadline which cancels the
+    /// body read still knows the answer was a 413.
+    static SEEN_413: std::sync::Arc<std::sync::Mutex<Option<http::HeaderMap>>>;
+}
+
+/// `tokio::time::timeout(deadline, fut)` for a bridge's whole non-streaming
+/// operation (send plus error mapping), keeping a provider 413 request-scoped
+/// (D9) when the deadline cancels the mapping after the 413 head arrived.
+///
+/// `Ok` is `fut`'s own output. On expiry: `Err(Some(_))` is
+/// [`unrelayable_413`] when a 413 head was seen, `Err(None)` an ordinary
+/// timeout the caller reports as before. The deadline itself is unchanged.
+pub async fn timeout_keeping_413<F: std::future::Future>(
+    deadline: Duration,
+    fut: F,
+) -> Result<F::Output, Option<BridgeError>> {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+    match tokio::time::timeout(deadline, SEEN_413.scope(seen.clone(), fut)).await {
+        Ok(out) => Ok(out),
+        Err(_) => Err(seen
+            .lock()
+            .ok()
+            .and_then(|mut headers| headers.take())
+            .map(|headers| {
+                unrelayable_413(
+                    &headers,
+                    &format!(
+                        "reading it did not finish within the {}ms upstream deadline",
+                        deadline.as_millis()
+                    ),
+                )
+            })),
+    }
+}
+
 /// Read a non-2xx upstream body and decide the D9 relay for it.
 ///
 /// Returns the body for the caller's own error normalization, as
@@ -597,6 +634,13 @@ pub async fn read_error_body_for_relay(
     let status = resp.status().as_u16();
     let headers = resp.headers().clone();
     let limit = if status == 413 {
+        // Known before the body: an enclosing deadline that cancels the read
+        // must still answer request-scoped.
+        let _ = SEEN_413.try_with(|seen| {
+            if let Ok(mut seen) = seen.lock() {
+                *seen = Some(headers.clone());
+            }
+        });
         MAX_UPSTREAM_RELAY_BODY_BYTES
     } else {
         MAX_UPSTREAM_ERROR_BODY_BYTES
@@ -2064,6 +2108,31 @@ mod tests {
         let (parse, relay) = read_error_body_for_relay(error_response(503, body.into())).await;
         assert!(relay.is_none());
         assert_eq!(parse.bytes.len(), MAX_UPSTREAM_ERROR_BODY_BYTES);
+    }
+
+    /// A deadline that cancels the error mapping after a 413 head keeps the
+    /// 413 request-scoped; any other expiry stays an ordinary timeout, and a
+    /// finished future is returned unchanged.
+    #[tokio::test]
+    async fn timeout_keeping_413_remembers_a_413_head_past_the_deadline() {
+        let d = Duration::from_millis(20);
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-upstream-marker", "kept".parse().unwrap());
+        let seen_then_stall = async {
+            SEEN_413.with(|seen| *seen.lock().unwrap() = Some(headers.clone()));
+            std::future::pending::<()>().await
+        };
+        let relay = match timeout_keeping_413(d, seen_then_stall).await {
+            Err(Some(BridgeError::UpstreamRelay(relay))) => relay,
+            other => panic!("expected the request-scoped 413, got {other:?}"),
+        };
+        assert_eq!(relay.status, 413);
+        assert_eq!(relay.headers["x-upstream-marker"], "kept");
+        assert!(matches!(
+            timeout_keeping_413(d, std::future::pending::<()>()).await,
+            Err(None)
+        ));
+        assert!(matches!(timeout_keeping_413(d, async { 7 }).await, Ok(7)));
     }
 
     #[test]

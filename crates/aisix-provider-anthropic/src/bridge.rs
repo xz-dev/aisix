@@ -275,9 +275,11 @@ where
 {
     match deadline {
         None => fut.await,
-        Some(d) => match tokio::time::timeout(d, fut).await {
+        Some(d) => match aisix_gateway::timeout_keeping_413(d, fut).await {
             Ok(r) => r,
-            Err(_) => Err(BridgeError::Timeout {
+            // A 413 head arrived before the deadline: request-scoped (D9).
+            Err(Some(refusal)) => Err(refusal),
+            Err(None) => Err(BridgeError::Timeout {
                 elapsed_ms: started.elapsed().as_millis() as u64,
                 cause: String::new(),
             }),
