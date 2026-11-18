@@ -731,7 +731,7 @@ async fn dispatch(
     }
 
     crate::usage_attr::note_failure_request(snapshot, || {
-        serde_json::to_string(&*body).unwrap_or_default()
+        crate::splice::capture_json(body, spooled.and_then(|s| s.store.as_deref()))
     });
 
     let model_rl =

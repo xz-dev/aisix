@@ -520,10 +520,20 @@ async fn content_capture_never_sees_a_marker() {
         let all = got.lock().unwrap().join("\n");
         if all.matches("gen_ai.input.messages").count() >= 2 {
             assert!(!all.contains("aisix-spool-"), "a marker reached capture");
+            // Two blobs per request: the image URL keeps its placeholder,
+            // and the structured capture omits the `file_data` data URI as a
+            // whole, reporting only the placeholder's own 23-byte length
+            // (`[spooled 3145750 bytes]`), never the blob.
             assert_eq!(
                 all.matches("[spooled 31457").count(),
-                4,
-                "two blobs per request"
+                2,
+                "one image placeholder per request"
+            );
+            assert_eq!(
+                all.matches("[aisix: base64 data uri omitted, 23 bytes]")
+                    .count(),
+                2,
+                "one omitted file_data placeholder per request"
             );
             break;
         }
