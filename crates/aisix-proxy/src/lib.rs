@@ -7975,6 +7975,17 @@ data: [DONE]\n\n";
     /// both `fallback_on_statuses` and the primary's cooldown triggers, so
     /// only D9's request scoping keeps a 413 to one attempt on the primary.
     fn relay_413_app(route: RelayRoute, primary_uri: &str, secondary_uri: &str) -> axum::Router {
+        relay_413_app_with_timeout(route, primary_uri, secondary_uri, None)
+    }
+
+    /// [`relay_413_app`] with the primary's end-to-end non-streaming
+    /// `timeout` (ms).
+    fn relay_413_app_with_timeout(
+        route: RelayRoute,
+        primary_uri: &str,
+        secondary_uri: &str,
+        primary_timeout_ms: Option<u64>,
+    ) -> axum::Router {
         let snap = AisixSnapshot::new();
         snap.provider_keys
             .insert(relay_pk("pk-a", primary_uri, route.provider));
@@ -7986,6 +7997,7 @@ data: [DONE]\n\n";
             trigger_statuses: Some(vec![413]),
             ..Default::default()
         });
+        first.timeout = primary_timeout_ms;
         snap.models.insert(ResourceEntry::new("m-a", first, 1));
         snap.models.insert(ResourceEntry::new(
             "m-b",
@@ -8088,6 +8100,14 @@ data: [DONE]\n\n";
     /// more body bytes than it sends before closing, so reading the body
     /// fails after the status is known. Counts the requests it answered.
     async fn interrupted_413_upstream() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        short_413_upstream(std::time::Duration::ZERO).await
+    }
+
+    /// [`interrupted_413_upstream`] that holds the connection open for
+    /// `stall` after the partial body before closing it.
+    async fn short_413_upstream(
+        stall: std::time::Duration,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -8134,10 +8154,56 @@ data: [DONE]\n\n";
                         )
                         .await;
                     let _ = sock.flush().await;
+                    tokio::time::sleep(stall).await;
                 });
             }
         });
         (format!("http://{addr}"), calls)
+    }
+
+    /// Review regression (D9 request scoping across a bridge's whole-call
+    /// deadline): a 413 whose body stalls past the primary's 250 ms
+    /// non-streaming timeout is still request-scoped. With retries 2, 413 in
+    /// `fallback_on_statuses` and a 413 cooldown trigger: status 413 with the
+    /// gateway envelope, exactly one primary attempt per request, no
+    /// secondary, answered at the deadline, and the next request still
+    /// reaches the primary (no cooldown).
+    async fn assert_stalled_413_request_scoped(route: RelayRoute) {
+        let (primary, calls) = short_413_upstream(std::time::Duration::from_secs(2)).await;
+        let secondary = unreached_secondary().await;
+        let app = relay_413_app_with_timeout(route, &primary, &secondary.uri(), Some(250));
+        for request in 1..=2 {
+            let started = std::time::Instant::now();
+            let resp = run(app.clone(), relay_request(route)).await;
+            let elapsed = started.elapsed();
+            assert_unrelayable_413(resp, route).await;
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                request,
+                "{}: a known 413 was retried or the primary was cooled down",
+                route.uri
+            );
+            assert!(
+                elapsed < std::time::Duration::from_millis(1500),
+                "{}: took {elapsed:?}",
+                route.uri
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_keeps_a_413_with_a_stalled_body_request_scoped() {
+        assert_stalled_413_request_scoped(RELAY_CHAT).await;
+    }
+
+    #[tokio::test]
+    async fn translated_messages_keep_a_413_with_a_stalled_body_request_scoped() {
+        assert_stalled_413_request_scoped(RELAY_TRANSLATED).await;
+    }
+
+    #[tokio::test]
+    async fn responses_keeps_a_413_with_a_stalled_body_request_scoped() {
+        assert_stalled_413_request_scoped(RELAY_RESPONSES).await;
     }
 
     /// Review regression (D9 request scoping): a 413 whose body read fails is

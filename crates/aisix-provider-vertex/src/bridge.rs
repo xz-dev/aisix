@@ -593,9 +593,11 @@ where
 {
     match deadline {
         None => fut.await,
-        Some(d) => match tokio::time::timeout(d, fut).await {
+        Some(d) => match aisix_gateway::timeout_keeping_413(d, fut).await {
             Ok(r) => r,
-            Err(_) => Err(BridgeError::Timeout {
+            // A 413 head arrived before the deadline: request-scoped (D9).
+            Err(Some(refusal)) => Err(refusal),
+            Err(None) => Err(BridgeError::Timeout {
                 elapsed_ms: started.elapsed().as_millis() as u64,
                 cause: String::new(),
             }),
@@ -5105,6 +5107,112 @@ mod tests {
                 "totalTokenCount": 6
             }
         }))
+    }
+
+    /// An upstream answering every request with a 413 head that declares 100
+    /// more body bytes than it sends, then stalls for 2 s. Counts requests.
+    async fn stalled_413_upstream() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let counter = calls.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 8192];
+                    loop {
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                            continue;
+                        };
+                        let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                        let len = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if buf.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 413 Payload Too Large\r\n\
+                              content-type: text/html\r\n\
+                              content-length: 107\r\n\
+                              x-upstream-marker: kept\r\n\r\npartial",
+                        )
+                        .await;
+                    let _ = sock.flush().await;
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), calls)
+    }
+
+    /// The bridge's answer to a 413 whose body stalled past the whole-call
+    /// deadline: the request-scoped relay (D9), at the deadline.
+    fn assert_stalled_413_relay(err: BridgeError, elapsed: std::time::Duration) {
+        let BridgeError::UpstreamRelay(relay) = err else {
+            panic!("a stalled 413 lost its request scope: {err:?}");
+        };
+        assert_eq!(relay.status, 413);
+        assert_eq!(relay.headers["x-upstream-marker"], "kept");
+        let v: serde_json::Value = serde_json::from_slice(&relay.body).unwrap();
+        assert_eq!(v["error"]["code"], "request_too_large");
+        assert!(
+            elapsed < std::time::Duration::from_millis(1500),
+            "{elapsed:?}"
+        );
+    }
+
+    /// Review regression: non-streaming Gemini chat (also the translated
+    /// `/v1/responses` leg) wraps send and error mapping in one deadline; a
+    /// 413 whose body stalls past it stays request-scoped instead of
+    /// becoming a retryable timeout.
+    #[tokio::test]
+    async fn chat_gemini_keeps_a_413_with_a_stalled_body_request_scoped() {
+        let (base, calls) = stalled_413_upstream().await;
+        let bridge = VertexBridge::new().with_api_base_override(base);
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("gemini-1.5-pro"),
+            sample_pk_with_secret(valid_secret_json()),
+        )
+        .with_deadline(std::time::Duration::from_millis(250));
+        let req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+        let started = std::time::Instant::now();
+        let err = bridge.chat(&req, &ctx).await.unwrap_err();
+        assert_stalled_413_relay(err, started.elapsed());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// The same for Claude on Vertex (`:rawPredict`), the other non-streaming
+    /// chat leg under the whole-call deadline.
+    #[tokio::test]
+    async fn chat_anthropic_keeps_a_413_with_a_stalled_body_request_scoped() {
+        let (base, calls) = stalled_413_upstream().await;
+        let bridge = VertexBridge::new().with_api_base_override(base);
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("claude-sonnet-4-5"),
+            sample_pk_with_secret(valid_secret_json()),
+        )
+        .with_deadline(std::time::Duration::from_millis(250));
+        let req = ChatFormat::new("my-claude", vec![ChatMessage::user("hi")]);
+        let started = std::time::Instant::now();
+        let err = bridge.chat(&req, &ctx).await.unwrap_err();
+        assert_stalled_413_relay(err, started.elapsed());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
