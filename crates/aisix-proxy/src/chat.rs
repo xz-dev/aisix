@@ -2068,7 +2068,9 @@ async fn dispatch(
             let err = last_err.unwrap_or_else(|| {
                 BridgeError::Config("streaming routing exhausted with no targets".into())
             });
-            return Err(with_model(ProxyError::Bridge(err)).with_routing(stream_routing));
+            let err =
+                crate::routing::caller_visible_routing_error(&virtual_entry.value, err.into());
+            return Err(with_model(err).with_routing(stream_routing));
         };
         let StreamWin {
             model,
@@ -3255,7 +3257,8 @@ async fn dispatch(
         let err = last_err.unwrap_or_else(|| {
             BridgeError::Config("routing exhausted with no targets attempted".into())
         });
-        return Err(with_model(ProxyError::Bridge(err)).with_routing(routing));
+        let err = crate::routing::caller_visible_routing_error(&virtual_entry.value, err.into());
+        return Err(with_model(err).with_routing(routing));
     };
     let provider_name = chosen_provider.unwrap_or_else(|| "unknown".into());
     let provider_key_id = chosen_provider_key_id.unwrap_or_else(|| "unknown".into());

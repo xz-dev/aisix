@@ -592,7 +592,7 @@ pub(crate) fn relayed_failure(status: u16, body: &[u8]) -> (&'static str, String
 pub(crate) fn attempt_reached_upstream(err: &ProxyError) -> bool {
     match err {
         ProxyError::Bridge(be) => be.reached_upstream(),
-        ProxyError::ContentFiltered { .. } => true,
+        ProxyError::ContentFiltered { .. } | ProxyError::RoutingTargetUnavailable => true,
         ProxyError::MissingAuth(_)
         | ProxyError::MissingRouteAuthHeader(_)
         | ProxyError::InvalidApiKey

@@ -14579,4 +14579,413 @@ event: message_stop\ndata: {}\n\n",
             }
         }
     }
+
+    /// A model group's failures as its caller sees them: a target the gateway
+    /// selected that answers "no such model" is the gateway's routing failure,
+    /// while the caller's own unknown model and a target's policy refusal keep
+    /// their status and body.
+    mod aggregate_target_errors {
+        use super::*;
+
+        /// The internal model name a missing target reports. It must not reach the
+        /// caller of the group.
+        const INTERNAL_MODEL: &str = "internal-backup-model";
+
+        /// A target that no longer knows the model it was sent.
+        fn model_not_found_400() -> String {
+            serde_json::json!({"error": {
+                "message": format!("The model `{INTERNAL_MODEL}` does not exist."),
+                "type": "invalid_request_error",
+                "param": "model",
+                "code": "model_not_found",
+            }})
+            .to_string()
+        }
+
+        /// An OpenAI-compatible router with no provider for the model it was sent.
+        fn unknown_provider_400() -> String {
+            serde_json::json!({"error": {
+                "message": format!("unknown provider for model {INTERNAL_MODEL}"),
+                "type": "invalid_request_error",
+                "code": "model_not_found",
+                "param": "model",
+            }})
+            .to_string()
+        }
+
+        #[test]
+        fn nonaggregate_semantic_model_keeps_upstream_missing_model_error() {
+            let public_model: Model = serde_json::from_value(serde_json::json!({
+                "display_name": "semantic-router",
+                "semantic": {
+                    "embedding_model": "embed", "default": "primary",
+                    "routes": [{"name": "backup", "target": "backup", "examples": ["a"]}]
+                }
+            }))
+            .unwrap();
+            assert!(public_model.is_semantic());
+            let upstream = aisix_gateway::upstream_status_of_body(
+                400,
+                b"",
+                None,
+                aisix_gateway::UpstreamWire::OpenAI,
+                |_| {
+                    Some(aisix_gateway::UpstreamErrorView {
+                        code: Some("model_not_found".into()),
+                        ..Default::default()
+                    })
+                },
+            );
+            let result =
+                crate::routing::caller_visible_routing_error(&public_model, upstream.into());
+            assert!(matches!(result, crate::error::ProxyError::Bridge(_)));
+        }
+
+        fn policy_body(code: &str) -> String {
+            serde_json::json!({"error": {
+                "message": "Request blocked by upstream content policy.",
+                "type": "invalid_request_error",
+                "code": code,
+            }})
+            .to_string()
+        }
+
+        fn ordinary_400() -> String {
+            serde_json::json!({"error": {
+                "message": "Invalid value for 'temperature'.",
+                "type": "invalid_request_error",
+                "param": "temperature",
+                "code": "invalid_value",
+            }})
+            .to_string()
+        }
+
+        /// A body each route accepts as a success.
+        fn success_body(route: RelayRoute) -> serde_json::Value {
+            if route.upstream_path == "/v1/responses" {
+                serde_json::json!({
+                    "id": "resp_ok", "object": "response", "status": "completed",
+                    "model": "gpt-4o",
+                    "output": [{"type": "message", "id": "msg_ok", "role": "assistant",
+                        "status": "completed",
+                        "content": [{"type": "output_text", "text": "ok", "annotations": []}]}],
+                    "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+                })
+            } else {
+                serde_json::json!({
+                    "id": "cmpl-ok", "object": "chat.completion", "model": "gpt-4o",
+                    "choices": [{"index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                })
+            }
+        }
+
+        /// An upstream that answers `status`/`body` and must be called exactly
+        /// `calls` times (checked when the server drops).
+        async fn upstream(route: RelayRoute, status: u16, body: String, calls: u64) -> MockServer {
+            let server = MockServer::builder().start().await;
+            Mock::given(method("POST"))
+                .and(path(route.upstream_path))
+                .respond_with(ResponseTemplate::new(status).set_body_raw(body, "application/json"))
+                .expect(calls)
+                .mount(&server)
+                .await;
+            server
+        }
+
+        /// A failover group `smart` over `primary` (`m-a`) and `backup` (`m-b`),
+        /// no same-target retries, and the fallback statuses the production group
+        /// carries.
+        fn group_state(route: RelayRoute, primary_uri: &str, backup_uri: &str) -> ProxyState {
+            let snap = AisixSnapshot::new();
+            snap.provider_keys
+                .insert(relay_pk("pk-a", primary_uri, route.provider));
+            snap.provider_keys
+                .insert(relay_pk("pk-b", backup_uri, route.provider));
+            snap.models.insert(ResourceEntry::new(
+                "m-a",
+                relay_model("m-a", "primary", "pk-a", route.provider),
+                1,
+            ));
+            snap.models.insert(ResourceEntry::new(
+                "m-b",
+                relay_model("m-b", "backup", "pk-b", route.provider),
+                1,
+            ));
+            let group: Model = serde_json::from_value(serde_json::json!({
+                "display_name": "smart",
+                "routing": {
+                    "strategy": "failover",
+                    "targets": [{"model": "primary"}, {"model": "backup"}],
+                    "retries": 0,
+                    "fallback_on_statuses": [400, 401, 402, 403, 404],
+                }
+            }))
+            .unwrap();
+            snap.models
+                .insert(ResourceEntry::new("router-smart", group, 1));
+            snap.apikeys
+                .insert(apikey_entry("sk-caller", &["smart", "primary"]));
+            build_state(snap, relay_hub())
+        }
+
+        fn cool(state: &ProxyState, model_id: &str) {
+            state.runtime_status.mark_cooldown(
+                model_id,
+                std::time::Duration::from_secs(60),
+                "test",
+            );
+            assert_eq!(
+                state.runtime_status.status(model_id).status,
+                crate::health::RuntimeStatus::Cooldown,
+                "{model_id} must be cooling before the request"
+            );
+        }
+
+        async fn send(
+            state: ProxyState,
+            route: RelayRoute,
+        ) -> (u16, axum::http::HeaderMap, String) {
+            let resp = run(build_router(state), relay_request(route)).await;
+            let status = resp.status().as_u16();
+            let headers = resp.headers().clone();
+            let bytes = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+            (
+                status,
+                headers,
+                String::from_utf8_lossy(&bytes).into_owned(),
+            )
+        }
+
+        /// The gateway's own routing failure: 502, a JSON error, and nothing that
+        /// names the internal target.
+        fn assert_routing_failure(route: RelayRoute, status: u16, body: &str) {
+            assert_eq!(status, 502, "{}: {body}", route.uri);
+            let v: serde_json::Value = serde_json::from_str(body)
+                .unwrap_or_else(|e| panic!("{}: not JSON ({e}): {body}", route.uri));
+            assert!(v["error"]["message"].is_string(), "{}: {v}", route.uri);
+            assert_eq!(v["error"]["type"], "api_error", "{}: {v}", route.uri);
+            assert!(
+                !body.contains(INTERNAL_MODEL) && !body.contains("backup"),
+                "{}: internal target leaked: {body}",
+                route.uri
+            );
+        }
+
+        /// Primary 503, then the selected backup's model is gone: one call each.
+        async fn primary_503_then_backup_model_missing(route: RelayRoute) {
+            let primary = upstream(
+                route,
+                503,
+                r#"{"error":{"message":"overloaded"}}"#.into(),
+                1,
+            )
+            .await;
+            let backup = upstream(route, 400, model_not_found_400(), 1).await;
+            let (status, _, body) =
+                send(group_state(route, &primary.uri(), &backup.uri()), route).await;
+            assert_routing_failure(route, status, &body);
+        }
+
+        /// Primary cooling (skipped, never called), then the selected backup has
+        /// no provider for its model.
+        async fn primary_cooling_then_backup_provider_unknown(route: RelayRoute) {
+            let primary = upstream(route, 200, success_body(route).to_string(), 0).await;
+            let backup = upstream(route, 400, unknown_provider_400(), 1).await;
+            let state = group_state(route, &primary.uri(), &backup.uri());
+            cool(&state, "m-a");
+            let (status, _, body) = send(state, route).await;
+            assert_routing_failure(route, status, &body);
+        }
+
+        /// A policy refusal from the selected backup keeps its status and the
+        /// exact `error` object the deployed gateway renders for it.
+        async fn policy_refusal_unchanged(route: RelayRoute, status: u16, code: &str) {
+            let primary = upstream(
+                route,
+                503,
+                r#"{"error":{"message":"overloaded"}}"#.into(),
+                1,
+            )
+            .await;
+            let backup = upstream(route, status, policy_body(code), 1).await;
+            let (got, _, body) =
+                send(group_state(route, &primary.uri(), &backup.uri()), route).await;
+            assert_eq!(got, status, "{}: {body}", route.uri);
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                v,
+                serde_json::json!({"error": {
+                    "code": code,
+                    "message": "Request blocked by upstream content policy.",
+                    "type": "upstream_error",
+                }}),
+            );
+        }
+
+        #[tokio::test]
+        async fn responses_primary_503_then_missing_backup_model_is_502() {
+            primary_503_then_backup_model_missing(RELAY_RESPONSES).await;
+        }
+
+        #[tokio::test]
+        async fn responses_cooling_primary_then_unknown_backup_provider_is_502() {
+            primary_cooling_then_backup_provider_unknown(RELAY_RESPONSES).await;
+        }
+
+        #[tokio::test]
+        async fn chat_primary_503_then_missing_backup_model_is_502() {
+            primary_503_then_backup_model_missing(RELAY_CHAT).await;
+        }
+
+        #[tokio::test]
+        async fn chat_cooling_primary_then_unknown_backup_provider_is_502() {
+            primary_cooling_then_backup_provider_unknown(RELAY_CHAT).await;
+        }
+
+        #[tokio::test]
+        async fn translated_messages_primary_503_then_missing_backup_model_is_502() {
+            primary_503_then_backup_model_missing(RELAY_TRANSLATED).await;
+        }
+
+        #[tokio::test]
+        async fn translated_messages_cooling_primary_then_unknown_backup_provider_is_502() {
+            primary_cooling_then_backup_provider_unknown(RELAY_TRANSLATED).await;
+        }
+
+        /// The same failure reaches the caller as a 502 on a streaming request.
+        #[tokio::test]
+        async fn streaming_responses_and_chat_missing_backup_model_is_502() {
+            for (route, body) in [
+                (
+                    RELAY_RESPONSES,
+                    r#"{"model":"smart","input":"hi","stream":true}"#,
+                ),
+                (
+                    RELAY_CHAT,
+                    r#"{"model":"smart","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+                ),
+            ] {
+                let route = RelayRoute { body, ..route };
+                primary_503_then_backup_model_missing(route).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn responses_and_chat_policy_400_and_403_are_unchanged() {
+            for route in [RELAY_RESPONSES, RELAY_CHAT] {
+                policy_refusal_unchanged(route, 400, "content_policy_violation").await;
+                policy_refusal_unchanged(route, 403, "content_filter").await;
+            }
+        }
+
+        #[tokio::test]
+        async fn responses_and_chat_ordinary_400_is_unchanged() {
+            for route in [RELAY_RESPONSES, RELAY_CHAT] {
+                let primary = upstream(
+                    route,
+                    503,
+                    r#"{"error":{"message":"overloaded"}}"#.into(),
+                    1,
+                )
+                .await;
+                let backup = upstream(route, 400, ordinary_400(), 1).await;
+                let (status, _, body) =
+                    send(group_state(route, &primary.uri(), &backup.uri()), route).await;
+                assert_eq!(status, 400, "{}: {body}", route.uri);
+                let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(v["error"]["code"], "invalid_value", "{v}");
+                assert_eq!(v["error"]["param"], "temperature", "{v}");
+            }
+        }
+
+        #[tokio::test]
+        async fn responses_and_chat_healthy_fallback_still_succeeds() {
+            for route in [RELAY_RESPONSES, RELAY_CHAT] {
+                let primary = upstream(
+                    route,
+                    503,
+                    r#"{"error":{"message":"overloaded"}}"#.into(),
+                    1,
+                )
+                .await;
+                let backup = upstream(route, 200, success_body(route).to_string(), 1).await;
+                let (status, _, body) =
+                    send(group_state(route, &primary.uri(), &backup.uri()), route).await;
+                assert_eq!(status, 200, "{}: {body}", route.uri);
+            }
+        }
+
+        /// The caller's own unknown model: the gateway's lookup answer, and no
+        /// upstream is contacted.
+        #[tokio::test]
+        async fn responses_and_chat_unknown_public_model_is_unchanged() {
+            for (route, body) in [
+                (RELAY_RESPONSES, r#"{"model":"no-such-model","input":"hi"}"#),
+                (
+                    RELAY_CHAT,
+                    r#"{"model":"no-such-model","messages":[{"role":"user","content":"hi"}]}"#,
+                ),
+            ] {
+                let route = RelayRoute { body, ..route };
+                let primary = upstream(route, 200, success_body(route).to_string(), 0).await;
+                let backup = upstream(route, 200, success_body(route).to_string(), 0).await;
+                let (status, _, body) =
+                    send(group_state(route, &primary.uri(), &backup.uri()), route).await;
+                assert!(
+                    status == 400 || status == 404,
+                    "{}: {status} {body}",
+                    route.uri
+                );
+            }
+        }
+
+        /// A direct model is the model the caller asked for, so its upstream's
+        /// "no such model" stays the caller's 400 with the upstream's fields.
+        #[tokio::test]
+        async fn responses_and_chat_direct_model_not_found_is_unchanged() {
+            for (route, body) in [
+                (RELAY_RESPONSES, r#"{"model":"primary","input":"hi"}"#),
+                (
+                    RELAY_CHAT,
+                    r#"{"model":"primary","messages":[{"role":"user","content":"hi"}]}"#,
+                ),
+            ] {
+                let route = RelayRoute { body, ..route };
+                let primary = upstream(route, 400, model_not_found_400(), 1).await;
+                let backup = upstream(route, 200, success_body(route).to_string(), 0).await;
+                let (status, _, body) =
+                    send(group_state(route, &primary.uri(), &backup.uri()), route).await;
+                assert_eq!(status, 400, "{}: {body}", route.uri);
+                let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(v["error"]["code"], "model_not_found", "{v}");
+            }
+        }
+
+        /// Every candidate unavailable (background-unhealthy; cooldown alone
+        /// never empties the list): the router's own 503 with a Retry-After
+        /// hint, and no upstream is contacted.
+        #[tokio::test]
+        async fn responses_and_chat_all_candidates_unavailable_is_503() {
+            for route in [RELAY_RESPONSES, RELAY_CHAT] {
+                let primary = upstream(route, 200, success_body(route).to_string(), 0).await;
+                let backup = upstream(route, 200, success_body(route).to_string(), 0).await;
+                let state = group_state(route, &primary.uri(), &backup.uri());
+                for id in ["m-a", "m-b"] {
+                    state.runtime_status.mark_unhealthy(id, Some(503), "test");
+                }
+                let (status, headers, body) = send(state, route).await;
+                assert_eq!(status, 503, "{}: {body}", route.uri);
+                assert!(
+                    headers.contains_key("retry-after"),
+                    "{}: {headers:?}",
+                    route.uri
+                );
+                let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(v["error"]["type"], "all_candidates_unavailable", "{v}");
+            }
+        }
+    }
 }
