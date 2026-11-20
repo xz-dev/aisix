@@ -12,7 +12,7 @@ jobs:
       contents: read
       packages: write
     env:
-      APPROVED_SHA: "6734303611311efb336470cd63f91da75dfa141a"
+      APPROVED_SHA: "adf73210b1fcfcef4d4c1fe90b2ee87e903242f0"
     steps:
       - uses: actions/checkout@v4
         with:

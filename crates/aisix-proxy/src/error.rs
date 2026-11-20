@@ -311,6 +311,13 @@ pub enum ProxyError {
     /// expiry. See [`aisix_core::WhenAllUnavailablePolicy`].
     #[error("all routing candidates are unavailable")]
     AllCandidatesUnavailable { retry_after_secs: Option<u64> },
+    /// A target the gateway selected for an aggregate model
+    /// answered that the model it was sent does not exist. The caller named
+    /// a valid model, so this is the gateway's routing failure (502), not a
+    /// caller error. The target's name stays in the logs and attempt
+    /// telemetry; see [`crate::routing::caller_visible_routing_error`].
+    #[error("the gateway could not route this request to an available target")]
+    RoutingTargetUnavailable,
     /// Caller-visible message MUST NOT carry the matched-pattern detail.
     /// Per #153, leaking the matched literal back to the caller defeats
     /// the point of an output guardrail (the whole purpose is to keep the
@@ -548,6 +555,7 @@ impl ProxyError {
             ProxyError::ProviderUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             ProxyError::SemanticDecisionFailed { .. } => StatusCode::SERVICE_UNAVAILABLE,
             ProxyError::AllCandidatesUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            ProxyError::RoutingTargetUnavailable => StatusCode::BAD_GATEWAY,
             ProxyError::ContentFiltered { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             ProxyError::BudgetExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
             ProxyError::BudgetUnverified => StatusCode::SERVICE_UNAVAILABLE,
@@ -607,6 +615,7 @@ impl ProxyError {
             // `error.code` carries the distinction.
             ProxyError::SemanticDecisionFailed { .. } => "api_error",
             ProxyError::AllCandidatesUnavailable { .. } => "all_candidates_unavailable",
+            ProxyError::RoutingTargetUnavailable => "api_error",
             ProxyError::ContentFiltered { .. } => "content_filter",
             ProxyError::BudgetExceeded(_) => "billing_error",
             // A gateway-side dependency failed, like `JwksUnavailable`;

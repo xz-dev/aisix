@@ -1093,7 +1093,10 @@ async fn dispatch(
         target_gate.refund_unserved(r).await;
     }
     Err(ResponsesDispatchError {
-        err: last_err.unwrap_or(ProxyError::ProviderUnavailable),
+        err: crate::routing::caller_visible_routing_error(
+            &model_entry.value,
+            last_err.unwrap_or(ProxyError::ProviderUnavailable),
+        ),
         routing,
     })
 }

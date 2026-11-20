@@ -128,6 +128,26 @@ pub fn is_retryable(err: &BridgeError, retry_on_429: bool, fallback_on_statuses:
     }
 }
 
+/// Translate only a configured aggregate's terminal missing-target error.
+/// Direct and semantic routes, and retry/cooldown decisions, are unchanged.
+/// A reported unknown provider uses the same structured `model_not_found`
+/// code; the message may contain an internal target name and is not matched.
+pub(crate) fn caller_visible_routing_error(public_model: &Model, err: ProxyError) -> ProxyError {
+    let missing_target = matches!(
+        &err,
+        ProxyError::Bridge(BridgeError::UpstreamStatus {
+            status: 400 | 404,
+            parsed: Some(view),
+            ..
+        }) if view.code.as_deref() == Some("model_not_found")
+    );
+    if public_model.is_routing() && missing_target {
+        ProxyError::RoutingTargetUnavailable
+    } else {
+        err
+    }
+}
+
 /// One WARN per failed routing-target attempt, naming the target, the
 /// error, whether the loop will move on, and the `fallback_on_statuses`
 /// list that answer was computed against.
