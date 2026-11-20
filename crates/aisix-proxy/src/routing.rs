@@ -817,7 +817,7 @@ where
                         },
                     );
                     if !retryable {
-                        return Err(e);
+                        return Err(caller_visible_routing_error(&entry.value, e));
                     }
                     last_err = Some(e);
                     if !budget_covers {
@@ -828,7 +828,10 @@ where
         }
     }
     target_gate.refund_unserved(request_reservation).await;
-    Err(last_err.unwrap_or(ProxyError::ProviderUnavailable))
+    Err(caller_visible_routing_error(
+        &entry.value,
+        last_err.unwrap_or(ProxyError::ProviderUnavailable),
+    ))
 }
 
 /// Balancing state is keyed per (virtual model, tier priority). Priority is

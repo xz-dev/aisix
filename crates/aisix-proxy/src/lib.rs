@@ -14699,6 +14699,15 @@ event: message_stop\ndata: {}\n\n",
         /// no same-target retries, and the fallback statuses the production group
         /// carries.
         fn group_state(route: RelayRoute, primary_uri: &str, backup_uri: &str) -> ProxyState {
+            group_with_fallback_statuses(route, primary_uri, backup_uri, &[400, 401, 402, 403, 404])
+        }
+
+        fn group_with_fallback_statuses(
+            route: RelayRoute,
+            primary_uri: &str,
+            backup_uri: &str,
+            statuses: &[u16],
+        ) -> ProxyState {
             let snap = AisixSnapshot::new();
             snap.provider_keys
                 .insert(relay_pk("pk-a", primary_uri, route.provider));
@@ -14720,7 +14729,7 @@ event: message_stop\ndata: {}\n\n",
                     "strategy": "failover",
                     "targets": [{"model": "primary"}, {"model": "backup"}],
                     "retries": 0,
-                    "fallback_on_statuses": [400, 401, 402, 403, 404],
+                    "fallback_on_statuses": statuses,
                 }
             }))
             .unwrap();
@@ -14823,6 +14832,28 @@ event: message_stop\ndata: {}\n\n",
                     "type": "upstream_error",
                 }}),
             );
+        }
+
+        const COMPLETIONS: RelayRoute = RelayRoute {
+            provider: "openai",
+            upstream_path: "/completions",
+            uri: "/v1/completions",
+            body: r#"{"model":"smart","prompt":"hi"}"#,
+        };
+
+        #[tokio::test]
+        async fn completions_primary_503_then_missing_backup_model_is_502() {
+            primary_503_then_backup_model_missing(COMPLETIONS).await;
+        }
+
+        #[tokio::test]
+        async fn completions_nonretryable_missing_target_is_502_without_fallback() {
+            let primary = upstream(COMPLETIONS, 400, model_not_found_400(), 1).await;
+            let backup = upstream(COMPLETIONS, 500, String::new(), 0).await;
+            let state =
+                group_with_fallback_statuses(COMPLETIONS, &primary.uri(), &backup.uri(), &[]);
+            let (status, _, body) = send(state, COMPLETIONS).await;
+            assert_routing_failure(COMPLETIONS, status, &body);
         }
 
         #[tokio::test]
