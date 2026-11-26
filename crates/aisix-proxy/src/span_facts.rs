@@ -11,7 +11,7 @@
 //! attempts resolved theirs, and must not move the cell's "last target".
 
 use aisix_core::{AisixSnapshot, ApiSurface, Model, ProviderKey};
-use aisix_obs::{genai_provider_name, UpstreamFacts, UsageEvent};
+use aisix_obs::{genai_provider_name, InternalCallPurpose, UpstreamFacts, UsageEvent};
 
 /// The event's upstream, or `None` when it names none the snapshot holds:
 /// a pre-dispatch failure on a Model Group, a deleted row, a route with no
@@ -67,9 +67,24 @@ pub(crate) fn upstream_facts(
             ..UpstreamFacts::default()
         };
         return Some(
-            match pk
-                .and_then(|p| upstream_base(model, p, &event.operation, declares_additional_tools))
-            {
+            match pk.and_then(|p| {
+                if p.provider == "google"
+                    && event.operation == crate::operation::DECISIONS.operation
+                    && event.internal_call_purpose
+                        == Some(InternalCallPurpose::SemanticRouteDecision)
+                {
+                    return crate::gemini::native::decisions_endpoint(p)
+                        .ok()
+                        .map(String::from);
+                }
+                upstream_base(
+                    model,
+                    p,
+                    &event.operation,
+                    &event.inbound_protocol,
+                    declares_additional_tools,
+                )
+            }) {
                 Some(base) => facts.with_base_url(&base),
                 None => facts,
             },
@@ -129,6 +144,7 @@ fn upstream_base(
     model: &Model,
     pk: &ProviderKey,
     operation: &str,
+    inbound_protocol: &str,
     declares_additional_tools: bool,
 ) -> Option<String> {
     use aisix_core::Adapter;
@@ -144,6 +160,8 @@ fn upstream_base(
             .map(str::to_string);
     }
     let native = match operation {
+        "chat" if inbound_protocol == "gemini" => Some(ApiSurface::Gemini)
+            .filter(|s| crate::dispatch::serves_natively_with(model, Some(pk), *s)),
         "messages" | "count_tokens" => Some(ApiSurface::Messages)
             .filter(|s| crate::dispatch::serves_natively_with(model, Some(pk), *s)),
         "responses" => Some(ApiSurface::Responses).filter(|_| {
@@ -229,11 +247,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            upstream_base(&model, &pk, "responses", false).as_deref(),
+            upstream_base(&model, &pk, "responses", "openai", false).as_deref(),
             Some("https://native.example/v1")
         );
         assert_eq!(
-            upstream_base(&model, &pk, "responses", true).as_deref(),
+            upstream_base(&model, &pk, "responses", "openai", true).as_deref(),
             Some("https://chat.example/v1")
         );
     }

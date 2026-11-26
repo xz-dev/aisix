@@ -522,15 +522,17 @@ async fn dispatch(
             async move {
                 let model = &target.model;
 
-                // Per #168's reasoning on generations: only OpenAI's API documents
-                // the `/v1/images/edits` route + form shape. Routing another provider
-                // here would dispatch to an upstream that 404s — reject explicitly at
-                // the gateway boundary instead. Cross-provider editing wires
-                // (Gemini / Vertex / BFL) are the AISIX-Cloud#1360 Phase 2 follow-up.
-                if model.provider.as_deref() != Some("openai") {
+                // Per #168's reasoning on generations: only OpenAI's API and Azure
+                // OpenAI serve the `/v1/images/edits` route + form shape. Routing
+                // another provider here would dispatch to an upstream that 404s —
+                // reject explicitly at the gateway boundary instead. Cross-provider
+                // editing wires (Gemini / Vertex / BFL) are the AISIX-Cloud#1360
+                // Phase 2 follow-up.
+                let azure = crate::dispatch::references_azure_key(snapshot, model);
+                if model.provider.as_deref() != Some("openai") && !azure {
                     return Err(ProxyError::InvalidRequest(format!(
                         "{} is not an OpenAI provider; \
-                         /v1/images/edits requires OpenAI",
+                         /v1/images/edits requires OpenAI or Azure OpenAI",
                         crate::routing::refused_model_label(model_name, model)
                     )));
                 }
@@ -540,24 +542,53 @@ async fn dispatch(
                 let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
                 let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?;
 
-                let url = aisix_gateway::url_cache::cached_endpoint_url(
-                    &pk_entry.id,
-                    "proxy/images/edits",
-                    // Every resolve_base_url input, via the shared constructor
-                    // (#1017), plus the endpoint path.
-                    &{
-                        let [base, vendor, adapter] =
-                            crate::dispatch::pk_url_fingerprint(&pk_entry.value);
-                        [base, vendor, adapter, "/images/edits"]
-                    },
-                    || {
-                        let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
-                        Ok::<_, crate::error::ProxyError>(crate::dispatch::build_openai_url(
-                            &base,
-                            "/images/edits",
+                let (url, auth) = if azure {
+                    crate::dispatch::azure_upstream(
+                        &pk_entry,
+                        &upstream_model,
+                        aisix_provider_azure_openai::AzureOperation::ImageEdits,
+                    )
+                    .await
+                    .map_err(|e| {
+                        ProxyError::Bridge(crate::cooldown::note_failure(
+                            &state.runtime_status,
+                            &target.id,
+                            model.cooldown.as_ref(),
+                            e,
                         ))
-                    },
-                )?;
+                    })?
+                } else {
+                    let url = aisix_gateway::url_cache::cached_endpoint_url(
+                        &pk_entry.id,
+                        "proxy/images/edits",
+                        // Every resolve_base_url input, via the shared constructor
+                        // (#1017), plus the endpoint path.
+                        &{
+                            let [base, vendor, adapter] =
+                                crate::dispatch::pk_url_fingerprint(&pk_entry.value);
+                            [base, vendor, adapter, "/images/edits"]
+                        },
+                        || {
+                            let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
+                            Ok::<_, crate::error::ProxyError>(crate::dispatch::build_openai_url(
+                                &base,
+                                "/images/edits",
+                            ))
+                        },
+                    )?;
+                    let auth_hv = header::HeaderValue::from_str(&format!("Bearer {api_key}"))
+                        .map_err(|e| {
+                            ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
+                                "api key contains invalid header chars: {e}"
+                            )))
+                        })?;
+                    (url, (header::AUTHORIZATION, auth_hv))
+                };
+                // Azure's deployment route names the deployment in the URL and
+                // takes no `model` field; everywhere else it is the upstream id.
+                let send_model = !azure
+                    || aisix_provider_azure_openai::AzureOperation::ImageEdits
+                        .sends_body_model(&pk_entry.value);
                 let provider_label = provider.to_ascii_lowercase();
 
                 // Rebuild the multipart form with `model` rewritten. A `multipart::Form`
@@ -567,6 +598,9 @@ async fn dispatch(
                 let build_form = || {
                     let mut form = multipart::Form::new();
                     for (name, file_name, content_type, data) in fields {
+                        if name == "model" && !send_model {
+                            continue;
+                        }
                         let field_data = if name == "model" {
                             Bytes::copy_from_slice(upstream_model.as_bytes())
                         } else {
@@ -599,13 +633,7 @@ async fn dispatch(
                 // boundary). Reserved auth headers are protected by
                 // `apply_request_headers`.
                 let mut headers = axum::http::HeaderMap::new();
-                let auth_hv =
-                    header::HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
-                        ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
-                            "api key contains invalid header chars: {e}"
-                        )))
-                    })?;
-                headers.insert(header::AUTHORIZATION, auth_hv);
+                headers.insert(auth.0, auth.1);
                 let rid_hv = header::HeaderValue::from_str(request_id).map_err(|e| {
                     ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
                         "request_id contains invalid header chars: {e}"
@@ -663,7 +691,7 @@ async fn dispatch(
                                 tracker,
                                 model_id,
                                 cooldown_cfg,
-                                aisix_provider_openai::held_route_http_error(resp).await,
+                                crate::dispatch::held_route_http_error(azure, resp).await,
                             ));
                         }
                         let body_bytes = resp.bytes().await.map_err(|e| {
@@ -725,7 +753,9 @@ async fn dispatch(
     } = match dispatched {
         Ok(d) => d,
         Err(e) => {
-            reservation.commit_tokens(0).await;
+            reservation
+                .commit_tokens(aisix_ratelimit::TokenCharge::NONE)
+                .await;
             return Err(e);
         }
     };
@@ -744,7 +774,9 @@ async fn dispatch(
     let total_tokens = usage.as_ref().map_or(0, |u| {
         u64::from(u.prompt_tokens) + u64::from(u.completion_tokens)
     });
-    reservation.commit_tokens(total_tokens).await;
+    reservation
+        .commit_tokens(aisix_ratelimit::TokenCharge::reported(total_tokens))
+        .await;
 
     let captured_content = match (&captured_prompt, content_cap) {
         (Some(prompt), Some(cap)) => Some(CapturedContent::new(
@@ -828,7 +860,7 @@ mod tests {
 
     fn provider_key_entry(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
         let json = format!(
-            r#"{{"display_name":"openai-up","secret":"sk-up","api_base":"{api_base}","provider":"openai","adapter":"openai"}}"#
+            r#"{{"display_name":"openai-up","api_key":"sk-up","api_base":"{api_base}","provider":"openai","adapter":"openai"}}"#
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
         ResourceEntry::new(PK_ID, pk, 1)
@@ -1258,7 +1290,7 @@ mod tests {
         assert_eq!(
             v["error"]["message"],
             "request payload is invalid: model `mixed-group` (target `claude-img`) \
-             is not an OpenAI provider; /v1/images/edits requires OpenAI"
+             is not an OpenAI provider; /v1/images/edits requires OpenAI or Azure OpenAI"
         );
     }
 

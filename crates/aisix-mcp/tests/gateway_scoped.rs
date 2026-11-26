@@ -20,7 +20,7 @@ use aisix_core::{AisixSnapshot, McpServer, ResourceEntry};
 use aisix_mcp::{streamable_http_service, McpGateway, ToolAcl};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
-    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -78,8 +78,8 @@ impl ServerHandler for LabeledEcho {
         )
     }
 
-    fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::default();
+    fn get_info(&self) -> ServerConfig {
+        let mut info = ServerConfig::default();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info
     }
@@ -114,7 +114,7 @@ async fn serve(app: axum::Router) -> SocketAddr {
 /// Build a snapshot resource entry for an upstream at `addr`.
 fn mcp_entry(id: &str, name: &str, addr: &SocketAddr, enabled: bool) -> ResourceEntry<McpServer> {
     let server: McpServer = serde_json::from_value(serde_json::json!({
-        "display_name": name,
+        "name": name,
         "url": format!("http://{addr}/mcp"),
         "enabled": enabled
     }))

@@ -35,7 +35,7 @@ use std::sync::Arc;
 use aisix_mcp::{streamable_http_service, McpGateway};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
-    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -148,8 +148,8 @@ impl ServerHandler for ConformanceUpstream {
         Ok(result.into())
     }
 
-    fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::default();
+    fn get_info(&self) -> ServerConfig {
+        let mut info = ServerConfig::default();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info
     }
@@ -180,7 +180,7 @@ async fn main() {
     // gateway — the same construction `/mcp/{server}` uses in production,
     // so the suite exercises the shipped bridge + gateway chain.
     let server: aisix_core::McpServer = serde_json::from_value(serde_json::json!({
-        "display_name": "conformance",
+        "name": "conformance",
         "url": format!("http://{upstream_addr}/mcp"),
         "auth_type": "none",
     }))

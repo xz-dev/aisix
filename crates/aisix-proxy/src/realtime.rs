@@ -60,6 +60,8 @@
 //! the rate-limit reservation like the other non-chat surfaces (#911
 //! [21]).
 
+pub(crate) mod fun_asr;
+
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -81,7 +83,8 @@ use crate::error::ProxyError;
 use crate::state::ProxyState;
 use aisix_gateway::BridgeError;
 
-/// Azure Realtime GA api-version (see the jobs surface twin constant).
+/// Azure Realtime api-version when the Provider Key sets no `api_version`
+/// (see the jobs surface twin constant).
 const AZURE_REALTIME_API_VERSION: &str = "2024-10-01-preview";
 
 /// Subprotocol item carrying the caller's API key in the browser flow.
@@ -609,6 +612,7 @@ pub(crate) async fn realtime(
             let last_target = crate::request_metrics::LastTarget::new(&snapshot, &attributed);
             let addressed = Some(attributed.requested_model.as_str()).filter(|m| !m.is_empty());
             emit_access_log(
+                "/v1/realtime",
                 &method,
                 status,
                 started.elapsed(),
@@ -781,34 +785,38 @@ async fn prepare(
             req
         }
         Some(Adapter::AzureOpenai) => {
-            let base = pk_entry
-                .value
-                .api_base
-                .as_deref()
-                .map(str::trim)
-                .filter(|b| !b.is_empty())
-                .ok_or_else(|| {
-                    ProxyError::InvalidRequest(format!(
-                        "azure provider_key {:?} has no api_base",
-                        pk_entry.value.display_name
-                    ))
-                })?
-                .trim_end_matches('/')
-                .to_string();
-            let url = format!(
-                "{}/openai/realtime?api-version={AZURE_REALTIME_API_VERSION}&deployment={}",
-                to_ws_scheme(&base)?,
-                urlencode(&upstream_model)
-            );
+            let base = aisix_provider_azure_openai::AzureUpstreamRef::api_base_url(
+                pk_entry.value.api_base.as_deref(),
+            )
+            .map_err(ProxyError::Bridge)?;
+            // The v1 route names the deployment as `model` and takes no
+            // api-version; the dated route names it as `deployment`.
+            let url = match aisix_provider_azure_openai::dated_api_version(
+                pk_entry.value.api_version.as_deref(),
+                AZURE_REALTIME_API_VERSION,
+            ) {
+                Some(version) => format!(
+                    "{}/openai/realtime?api-version={version}&deployment={}",
+                    to_ws_scheme(&base)?,
+                    urlencode(&upstream_model)
+                ),
+                None => format!(
+                    "{}/openai/v1/realtime?model={}",
+                    to_ws_scheme(&base)?,
+                    urlencode(&upstream_model)
+                ),
+            };
             let mut req = url.into_client_request().map_err(|e| {
                 ProxyError::InvalidRequest(format!("invalid upstream realtime URL: {e}"))
             })?;
-            req.headers_mut().insert(
-                "api-key",
-                secret.parse().map_err(|_| {
-                    ProxyError::InvalidRequest("provider secret is not header-safe".into())
-                })?,
-            );
+            // A resource key goes out as `api-key`; an Entra ID
+            // client-credentials secret is exchanged for a bearer token.
+            let credential = aisix_provider_azure_openai::resolve_credential(&secret)
+                .await
+                .map_err(ProxyError::Bridge)?;
+            let (name, value) = aisix_provider_azure_openai::auth_header(&credential)
+                .map_err(ProxyError::Bridge)?;
+            req.headers_mut().insert(name, value);
             req
         }
         _ => {
@@ -1169,6 +1177,7 @@ async fn run_session(
                 })))
                 .await;
             emit_access_log(
+                "/v1/realtime",
                 &Method::GET,
                 status,
                 started.elapsed(),
@@ -1231,6 +1240,8 @@ async fn run_session(
                 crate::usage_attr::guardrail_scores(&audit),
                 crate::usage_attr::bypass_reason(&audit),
             );
+            // The detached session keeps the upgrade request's classification.
+            event.client_type = client.client_type().to_owned();
             // Same reason as the session-end event: no attribution cell here.
             // Realtime serves only direct models, so the entry is the target.
             event.model_id = model_entry.id.clone();
@@ -1509,9 +1520,12 @@ async fn run_session(
 
     let elapsed = started.elapsed();
     let total_tokens = usage.input_tokens + usage.output_tokens;
-    reservation.commit_tokens(total_tokens).await;
+    reservation
+        .commit_tokens(aisix_ratelimit::TokenCharge::reported(total_tokens))
+        .await;
 
     emit_access_log(
+        "/v1/realtime",
         &Method::GET,
         close_status,
         elapsed,
@@ -1582,7 +1596,8 @@ async fn run_session(
         upstream_response_headers,
         inbound_protocol: "realtime".to_string(),
         client_source_ip: client.source_ip.clone(),
-        client_user_agent: client.user_agent.clone(),
+        client_user_agent: client.user_agent.value.clone(),
+        client_type: client.client_type().to_owned(),
         request_headers: client.request_headers.clone(),
         // A frame the chain refused ends the session, so the session's one
         // terminal event is where the refusal has to be recorded — this is
@@ -1652,7 +1667,7 @@ async fn run_session(
             cached: usage.cached_tokens.min(u32::MAX as u64) as u32,
             cache_read: 0,
             cache_creation: 0,
-            client_type: state.client_classifier.classify(&client.user_agent),
+            client_type: client.client_type(),
         },
     );
 }
@@ -1942,6 +1957,7 @@ async fn guardrail_block_event(
 
 #[allow(clippy::too_many_arguments)]
 fn emit_access_log(
+    path: &str,
     method: &Method,
     status: u16,
     elapsed: Duration,
@@ -1967,7 +1983,7 @@ fn emit_access_log(
     let log_target = crate::attribution::AccessLogTarget::current();
     crate::attribution::emit_access_log(AccessLog {
         method: method.as_str(),
-        path: "/v1/realtime",
+        path,
         status,
         latency: elapsed,
         duration: elapsed,
@@ -2324,7 +2340,7 @@ mod tests {
     fn snapshot(api_base: &str, adapter: &str, provider: &str) -> AisixSnapshot {
         let snap = AisixSnapshot::new();
         let pk_json = format!(
-            r#"{{"display_name":"rt-pk","secret":"sk-up","api_base":"{api_base}","provider":"{provider}","adapter":"{adapter}"}}"#
+            r#"{{"display_name":"rt-pk","api_key":"sk-up","api_base":"{api_base}","provider":"{provider}","adapter":"{adapter}"}}"#
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&pk_json).unwrap();
         snap.provider_keys.insert(ResourceEntry::new(PK_ID, pk, 1));
@@ -2343,7 +2359,7 @@ mod tests {
     fn snapshot_forwarding(api_base: &str, forward: &[&str]) -> AisixSnapshot {
         let snap = snapshot(api_base, "openai", "openai");
         let pk_json = format!(
-            r#"{{"display_name":"rt-pk","secret":"sk-up","api_base":"{api_base}",
+            r#"{{"display_name":"rt-pk","api_key":"sk-up","api_base":"{api_base}",
                  "provider":"openai","adapter":"openai",
                  "request":{{"forward_client_headers":{}}}}}"#,
             serde_json::to_string(forward).unwrap()

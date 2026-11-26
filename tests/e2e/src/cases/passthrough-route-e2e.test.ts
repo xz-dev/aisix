@@ -154,7 +154,7 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
 
     const pk = await seed.createProviderKey({
       display_name: "ptr-openai-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: "http://unused-on-routes",
     });
     // The migration shape from the removed implicit tunnel: the route
@@ -243,7 +243,7 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
     upstreams.push(upstream);
     const pk = await seed.createProviderKey({
       display_name: "ptr-cred-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -327,7 +327,7 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
 
     const pk = await seed.createProviderKey({
       display_name: "ptr-anthropic-pk",
-      secret: "sk-ant-mock",
+      api_key: "sk-ant-mock",
       api_base: "http://unused-on-routes",
       provider: "anthropic",
       adapter: "anthropic",
@@ -393,7 +393,7 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
 
     const pk = await seed.createProviderKey({
       display_name: "ptr-boundary-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: "http://unused-on-routes",
     });
     await seed.createPassthroughRoute({
@@ -554,6 +554,37 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
     expect(bracketedKeyConflict.statusCode).toBe(400);
     await bracketedKeyConflict.body.text();
     expect(upstream.receivedRequests).toHaveLength(baseline);
+  });
+
+  test("existing Gemini path mounts keep their upstream and route authentication", async (ctx) => {
+    if (!app || !seed) return ctx.skip();
+    const upstream = await startOpenAiUpstream({ nonStreamBody: { routed: "gemini-mount" } });
+    upstreams.push(upstream);
+    const prefixes = ["/v1beta/models", "/v1beta1/projects/p/locations/l/publishers/google/models"];
+    for (const [i, prefix] of prefixes.entries()) {
+      await seed.createPassthroughRoute({
+        name: `gemini-mount-${i}`, path_prefix: prefix,
+        target_url: upstream.baseUrl + "/existing", auth_mode: "header_key",
+        auth_header_name: "x-route-login", credential_mode: "forward_client",
+      });
+    }
+    const login = "gemini-mount-caller";
+    await seed.createApiKey({
+      key_hash: createHash("sha256").update(login).digest("hex"),
+      allowed_models: ["*"], allowed_routes: ["*"],
+    });
+    const proxy = new ProxyClient(app.proxyUrl, login);
+    await waitConfigPropagation(async () => (await proxy.listModels()).status === 200);
+    for (const [i, action] of ["generateContent", "streamGenerateContent"].entries()) {
+      const suffix = "/upstream-alias:" + action;
+      const res = await fetch(app.proxyUrl + prefixes[i] + suffix, {
+        method: "POST", headers: { "content-type": "application/json", "x-route-login": login },
+        body: JSON.stringify({ contents: [{ parts: [{ text: "hello" }] }] }),
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ routed: "gemini-mount" });
+      expect(upstream.receivedRequests.at(-1)?.path).toBe("/existing" + suffix);
+    }
   });
 
   test("forward-proxy BYO: host match beats typed routes; Authorization forwarded verbatim", async (ctx) => {
@@ -788,7 +819,7 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
 
     const pk = await seed.createProviderKey({
       display_name: "ptr-sse-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: "http://unused-on-routes",
     });
     await seed.createPassthroughRoute({
@@ -865,7 +896,7 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
 
     const pk = await seed.createProviderKey({
       display_name: "ptr-sse-concurrency-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: "http://unused-on-routes",
     });
     await seed.createPassthroughRoute({
@@ -973,7 +1004,7 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
 
     const pk = await seed.createProviderKey({
       display_name: "ptr-sse-timeout-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: "http://unused-on-routes",
     });
     await seed.createPassthroughRoute({
@@ -1056,7 +1087,7 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
 
     const pk = await seed.createProviderKey({
       display_name: "ptr-sse-raw-chunk-timeout-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: "http://unused-on-routes",
     });
     await seed.createPassthroughRoute({
@@ -1149,7 +1180,7 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
 
     const pk = await seed.createProviderKey({
       display_name: "ptr-auto-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: "http://unused-on-routes",
     });
     for (const [name, prefix, upstream] of [

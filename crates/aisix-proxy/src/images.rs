@@ -448,21 +448,19 @@ async fn dispatch(
         |target, timeouts| {
             let body = &body;
             async move {
-                // Per #168: only OpenAI's API has the documented
-                // `/v1/images/generations` route + body shape. Anthropic has no
-                // image-generation API at all; Gemini's image generation lives
-                // at a different URL (`/v1beta/models/...:generateContent`) with
-                // a different body shape; DeepSeek doesn't expose image
-                // generation. Routing a non-OpenAI Model here would silently
-                // dispatch to an upstream that 404s — a confusing failure for
-                // callers who follow `docs/api-proxy.md` §4.9 configuration
-                // verbatim. Reject explicitly with 400 (parallel to
-                // /v1/responses §4.6) so the configuration error is visible
-                // at the gateway boundary.
-                if target.model.provider.as_deref() != Some("openai") {
+                // Per #168: only OpenAI's API and Azure OpenAI serve the
+                // documented `/v1/images/generations` route + body shape.
+                // Anthropic has no image-generation API at all; Gemini's image
+                // generation lives at a different URL with a different body
+                // shape; DeepSeek doesn't expose image generation. Routing any
+                // other Model here would dispatch to an upstream that 404s, so
+                // reject explicitly with 400 at the gateway boundary.
+                if target.model.provider.as_deref() != Some("openai")
+                    && !crate::dispatch::references_azure_key(snapshot, &target.model)
+                {
                     return Err(ProxyError::InvalidRequest(format!(
                         "{} is not an OpenAI provider; \
-                         /v1/images/generations requires OpenAI",
+                         /v1/images/generations requires OpenAI or Azure OpenAI",
                         crate::routing::refused_model_label(model_name, &target.model)
                     )));
                 }
@@ -514,7 +512,9 @@ async fn dispatch(
     } = match dispatched {
         Ok(d) => d,
         Err(e) => {
-            reservation.commit_tokens(0).await;
+            reservation
+                .commit_tokens(aisix_ratelimit::TokenCharge::NONE)
+                .await;
             return Err(e);
         }
     };
@@ -542,7 +542,9 @@ async fn dispatch(
             let total_tokens = usage.as_ref().map_or(0, |u| {
                 u64::from(u.prompt_tokens) + u64::from(u.completion_tokens)
             });
-            reservation.commit_tokens(total_tokens).await;
+            reservation
+                .commit_tokens(aisix_ratelimit::TokenCharge::reported(total_tokens))
+                .await;
             // Content capture (#700): CapturedContent::new truncates to the cap.
             let captured_content = match (&captured_prompt, content_cap) {
                 (Some(prompt), Some(cap)) => Some(CapturedContent::new(
@@ -570,7 +572,9 @@ async fn dispatch(
         // other failure left through the dispatch.
         Err(e) => {
             // No upstream call → no tokens to count; release the reservation.
-            reservation.commit_tokens(0).await;
+            reservation
+                .commit_tokens(aisix_ratelimit::TokenCharge::NONE)
+                .await;
             let env = ErrorEnvelope::new(e.to_string(), "not_implemented");
             Ok(ImageDispatchSuccess {
                 response: (StatusCode::NOT_IMPLEMENTED, Json(env)).into_response(),
@@ -688,7 +692,7 @@ pub(crate) fn emit_usage_event(
         inbound_protocol: "openai".to_string(),
         applied_guardrails: applied_guardrails.to_vec(),
         client_source_ip: client.source_ip.clone(),
-        client_user_agent: client.user_agent.clone(),
+        client_user_agent: client.user_agent.value.clone(),
         request_headers: client.request_headers.clone(),
         redacted_entity_counts,
         guardrail_monitor_hits,
@@ -733,7 +737,7 @@ pub(crate) fn emit_usage_event(
             cached: 0,
             cache_read: 0,
             cache_creation: 0,
-            client_type: state.client_classifier.classify(&client.user_agent),
+            client_type: client.client_type(),
         },
     );
 }
@@ -858,7 +862,7 @@ mod tests {
 
     fn provider_key_entry(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
         let json = format!(
-            r#"{{"display_name":"openai-up","secret":"sk-up","api_base":"{api_base}","provider":"openai","adapter":"openai"}}"#
+            r#"{{"display_name":"openai-up","api_key":"sk-up","api_base":"{api_base}","provider":"openai","adapter":"openai"}}"#
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
         ResourceEntry::new(PK_ID, pk, 1)
@@ -869,7 +873,7 @@ mod tests {
     /// attribution fields stamped via `usage_attr::apply_pk_telemetry`.
     fn provider_key_entry_tagged(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
         let json = format!(
-            r#"{{"display_name":"openai-up","secret":"sk-up","api_base":"{api_base}","provider":"openai","adapter":"openai","telemetry_tags":{{"kind":"catalog","featured":true,"branded_provider":"openai","pk_label":"prod-images-key"}}}}"#
+            r#"{{"display_name":"openai-up","api_key":"sk-up","api_base":"{api_base}","provider":"openai","adapter":"openai","telemetry_tags":{{"kind":"catalog","featured":true,"branded_provider":"openai","pk_label":"prod-images-key"}}}}"#
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
         ResourceEntry::new(PK_ID, pk, 1)

@@ -37,13 +37,13 @@ while the etcd prefix groups a collection of instances.
 
 ## Strictness: these files describe the write contract
 
-The published schemas carry the **write contract** for self-managed
-declarative writes: `aisix validate --resources` checks a file offline,
-and the `resources_file` source enforces the same shape at boot and
-SIGHUP. A payload that fails them — including unknown fields, where a
-resource closes them — is rejected on those paths. They are generated
-from the same producers the in-repo strict validators compile, so the
-published files and the gateway's own validators cannot drift.
+The published schemas carry the **write contract**: what a writer of
+resource documents — the control plane, or anyone writing etcd or a
+resources file by hand — should produce. They are generated from the same
+producers the in-repo strict validators compile, so the published files
+and the gateway's own validators cannot drift. The gateway itself reads
+every document, from etcd and from a `resources_file` alike, against the
+lenient schemas in `resources-lenient/`.
 
 Four top-level resources intentionally **omit**
 `additionalProperties: false` even on the write contract (the list is
@@ -69,14 +69,17 @@ etcd, and a **raw direct etcd put gets no synchronous validation** —
 the document is only checked on read, by the lenient loader below.
 Validate documents before putting them.
 
-The gateway's **etcd read path is deliberately more lenient** (#871): a
+The gateway's **read path — etcd, and a `resources_file`, which goes
+through the same loader — is deliberately more lenient** (#871): a
 stored document carrying fields outside these schemas still loads, with
 the unknown fields ignored and reported as partially compatible on
-`GET /status/config`, the heartbeat, and the
-`aisix_config_partially_compatible_resources` metric. This keeps an
-older gateway serving documents written by a newer control plane. Every
-other constraint in these files — types, required fields, ranges, closed
-enum value sets — applies on both paths.
+`GET /status/config` and the `aisix_config_partially_compatible_resources`
+metric (and, for a gateway connected to a control plane, the heartbeat). This keeps an
+older gateway serving documents written by a newer control plane. Types,
+required fields, ranges and closed enum value sets apply on the read path
+too, except for the write-only checks `resources-lenient/` relaxes (an
+empty `effort_mapping` value, for one) — diff the two sets for the exact
+difference. `aisix validate --resources` checks the read contract.
 
 That read contract is published too, as `resources-lenient/` — see below.
 
@@ -106,20 +109,21 @@ That is the tolerance the split exists for: an optional field a newer
 control plane adds inside a nested config object is ignored and reported,
 instead of taking the whole row down.
 
-For **nine** resources the read contract relaxes a requirement as well,
+For **eleven** resources the read contract relaxes a requirement as well,
 so a consumer that models the lenient set as "the strict set with
 `additionalProperties` stripped" is wrong about them:
 
 | resource | additionally relaxed on read |
 | --- | --- |
 | `api_key` | `McpAccess.allow` is not required; an `McpToolRef` entry needs neither half, and neither has to be non-empty; the write-path guards requiring `deny` beside `deny_ids` and `mcp_rate_limits` beside `mcp_rate_limits_by_id` are absent; the `tags` limits are absent (see `team`) |
-| `guardrail` | the `semantic` kind requires neither an embedding model (under either spelling) nor a threshold beside each example list; Bedrock `aws_credentials` may carry `external_id` or `role_session_name` without `role_arn` (unused without it) |
+| `guardrail` | the `semantic` kind does not require an embedding model (under either spelling); Bedrock `aws_credentials` may carry `external_id` or `role_session_name` without `role_arn` (unused without it) |
 | `mcp_policy` | `allow` is not required; the `McpToolRef` relaxations above apply here too, as does the absent `deny`-beside-`deny_ids` guard (its team-scope guard is on both sets) |
-| `mcp_server` | the label pattern (`name`, and its former spelling `display_name`) still forbids `__` and a trailing `_`, but not a `*` |
+| `mcp_server` | the label pattern (`name`) still forbids `__` and a trailing `_`, but not a `*` |
 | `observability_exporter` | `request_headers` / `upstream_response_headers` names are not checked (pattern, duplicates, refused credential and `set-cookie` names) — the gateway drops a refused name when capturing rather than the whole exporter |
 | `oidc_provider` | `tag_claims` is any object of strings, or `null` read as none: the key pattern, the non-empty path and the 32-entry cap are write-path limits, for the reason given under `team` — a row lost to one would stop the provider authenticating its callers |
 | `team`, `user` | `tags` is any object of strings, or `null` read as no tags: the key pattern, the 1–128-character value length and the 32-entry cap are write-path limits, so a stored row stays loadable if a later release relaxes them — for an `api_key` a row lost to one would stop the key authenticating |
-| `budget` | the per-scope shape is not checked — `tag` only and always for scope `tag`, `scope_ref` for every other scope, `exhausted_members` only for `team_member`: a row missing its target matches no request, which is no worse than not loading it |
+| `budget` | the write schema requires `tag` only for scope `tag`, `scope_ref` for every other scope, and allows `exhausted_members` only for `team_member`. It requires `period_start` on any mark with `period_end`. The read schema relaxes those checks. A row without its target matches no request, and an end without a start marks no interval |
+| `usage_accounting` | `exclude_estimated_usage` is not required: a stored row without it loads with the switch off, which is the behaviour without the row |
 | `model` | the per-kind `not`/`anyOf` lists that forbid a knob a kind never resolves are shorter — a stored row keeps loading and `Model::strip_kind_inapplicable` drops the dead knob; and an `effort_mapping` target value may be empty, which the write path refuses |
 
 Three of those are worth spelling out. A half-written `McpToolRef` entry
@@ -142,7 +146,7 @@ required on **both** sets. A scriptless `custom` row screens nothing
 either way, so rejecting it is what makes it visible in
 `GET /status/config`'s `rejected[]`.
 
-These come from the nine producers that take a `strict` flag in
+These come from the eleven producers that take a `strict` flag in
 `crates/aisix-core/src/models/schema.rs` and are deliberate.
 
 One consequence is registered rather than fixed: the gateway's own Admin

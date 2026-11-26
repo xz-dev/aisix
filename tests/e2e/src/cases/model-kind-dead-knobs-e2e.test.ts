@@ -20,8 +20,7 @@ import {
 //   dropping the whole row (which would take a working group out of
 //   service on upgrade). The WRITE half (strict) has no e2e surface
 //   here — the DP admin API is read-only for resources — and is pinned
-//   at the validator level (model_schema_characterization) and the
-//   declarative-file loader (filesource tests).
+//   at the validator level (model_schema_characterization).
 
 const CALLER_PLAINTEXT = "sk-dead-knobs-caller";
 const CALLER_KEY_HASH = createHash("sha256")
@@ -60,7 +59,7 @@ describe("model kind dead knobs e2e", () => {
     upstreams.push(upstream);
     const pk = await seed.createProviderKey({
       display_name: "dk-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

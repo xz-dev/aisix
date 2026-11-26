@@ -45,17 +45,53 @@ pub struct OpenAiRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     pub stream: bool,
-    /// `{"include_usage": true}` injected on streaming requests when the
-    /// caller didn't set `stream_options` itself — OpenAI-protocol
-    /// upstreams omit the terminal `usage` frame without it, which
-    /// zeroed token telemetry for every streaming request whose client
-    /// didn't ask (AISIX-Cloud#790). `None` whenever `extra` already
-    /// carries a client-supplied `stream_options` (the flattened map
-    /// wins; a typed duplicate would emit the key twice).
+    /// On a streaming request, the caller's `stream_options` with
+    /// `include_usage` forced to `true` — OpenAI-protocol upstreams omit
+    /// the terminal `usage` frame without it, and the gateway needs it for
+    /// token accounting whatever the caller asked (AISIX-Cloud#790,
+    /// AISIX-Cloud#2028). The caller's own choice is honoured on the way
+    /// back: the chat stream renderer forwards usage only when the caller
+    /// set `include_usage: true` ([`ChatFormat::include_usage`]). While
+    /// this is `Some`, `extra`'s own `stream_options` is not serialized.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_options: Option<serde_json::Value>,
     #[serde(flatten)]
-    pub extra: &'a serde_json::Map<String, serde_json::Value>,
+    pub extra: RequestExtra<'a>,
+}
+
+/// The caller's unmodelled request fields, minus `stream_options` when
+/// [`OpenAiRequest::stream_options`] carries the gateway's merged copy, so
+/// the key reaches the wire exactly once.
+#[derive(Debug, Clone)]
+pub struct RequestExtra<'a> {
+    pub fields: &'a serde_json::Map<String, serde_json::Value>,
+    skip_stream_options: bool,
+}
+
+impl Serialize for RequestExtra<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        for (k, v) in self.fields {
+            if self.skip_stream_options && k == "stream_options" {
+                continue;
+            }
+            map.serialize_entry(k, v)?;
+        }
+        map.end()
+    }
+}
+
+/// The caller's `stream_options` with `include_usage: true` merged in:
+/// other keys of an object are kept, and a value that is not an object
+/// (`null`, a scalar) is replaced.
+fn stream_options_with_usage(client: Option<&serde_json::Value>) -> serde_json::Value {
+    let mut options = match client {
+        Some(serde_json::Value::Object(o)) => o.clone(),
+        _ => serde_json::Map::new(),
+    };
+    options.insert("include_usage".into(), serde_json::Value::Bool(true));
+    serde_json::Value::Object(options)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -110,9 +146,11 @@ pub fn build_request<'a>(
         top_p: req.top_p,
         max_tokens: req.max_tokens,
         stream,
-        stream_options: (stream && !req.extra.contains_key("stream_options"))
-            .then(|| serde_json::json!({"include_usage": true})),
-        extra: &req.extra,
+        stream_options: stream.then(|| stream_options_with_usage(req.extra.get("stream_options"))),
+        extra: RequestExtra {
+            fields: &req.extra,
+            skip_stream_options: stream,
+        },
     }
 }
 
@@ -267,13 +305,15 @@ pub struct OpenAiResponseMessage {
 
 // `#[serde(default)]` at the container level so an upstream that omits
 // any token counter (OpenAI-compatible providers vary on which fields
-// they return) deserializes to 0 instead of failing the whole response
-// body decode with `502 upstream_decode_error` (#474).
+// they return) deserializes instead of failing the whole response body
+// decode with `502 upstream_decode_error` (#474). The prompt and
+// completion counts stay `None` when omitted, apart from a reported `0`:
+// only an omitted count is estimated.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct OpenAiUsage {
-    pub prompt_tokens: u32,
-    pub completion_tokens: u32,
+    pub prompt_tokens: Option<u32>,
+    pub completion_tokens: Option<u32>,
     pub total_tokens: u32,
     /// Present on responses that touched the prompt cache. Subset of
     /// `prompt_tokens`. Optional so older API versions / non-cached
@@ -446,8 +486,12 @@ pub fn into_usage(u: OpenAiUsage) -> UsageStats {
     let prompt = u.prompt_tokens_details.as_ref();
     let completion = u.completion_tokens_details.as_ref();
     UsageStats {
-        prompt_tokens: u.prompt_tokens,
-        completion_tokens: u.completion_tokens,
+        prompt_tokens: u.prompt_tokens.unwrap_or(0),
+        completion_tokens: u.completion_tokens.unwrap_or(0),
+        reported: aisix_gateway::ReportedCounts {
+            prompt: u.prompt_tokens.is_some(),
+            completion: u.completion_tokens.is_some(),
+        },
         total_tokens: u.total_tokens,
         // Normalize the cache-hit count into the canonical field for
         // ALL providers (#542): OpenAI nests it under
@@ -841,7 +885,7 @@ pub fn stream_chunk_into_chat_chunks(
 /// "both pass through" and #162.
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
-pub(crate) enum OpenAiEmbedInput<'a> {
+pub enum OpenAiEmbedInput<'a> {
     /// Single-string form. Used when the caller's request body had
     /// `input: "..."` (string), preserving the wire shape on the
     /// upstream side.
@@ -856,7 +900,7 @@ pub(crate) enum OpenAiEmbedInput<'a> {
 
 /// Request body forwarded to OpenAI `/v1/embeddings`.
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct OpenAiEmbedRequest<'a> {
+pub struct OpenAiEmbedRequest<'a> {
     pub model: &'a str,
     pub input: OpenAiEmbedInput<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -884,7 +928,7 @@ pub(crate) struct OpenAiEmbedRequest<'a> {
 /// serialises from proto3 and omits a zero `index`, so a single-input
 /// response carries none. A missing one is filled from the item's position.
 #[derive(Debug, Deserialize)]
-pub(crate) struct OpenAiEmbeddingObject {
+pub struct OpenAiEmbeddingObject {
     #[serde(default)]
     pub index: Option<u32>,
     pub object: String,
@@ -906,7 +950,7 @@ pub struct OpenAiEmbedUsage {
 
 /// Full response body from OpenAI `/v1/embeddings`.
 #[derive(Debug, Deserialize)]
-pub(crate) struct OpenAiEmbedResponse {
+pub struct OpenAiEmbedResponse {
     pub object: String,
     /// Defaults to empty, as on [`OpenAiResponse`].
     #[serde(default)]
@@ -916,7 +960,7 @@ pub(crate) struct OpenAiEmbedResponse {
     pub usage: Option<OpenAiEmbedUsage>,
 }
 
-pub(crate) fn embed_request_body<'a>(
+pub fn embed_request_body<'a>(
     req: &'a EmbeddingRequest,
     upstream_model: &'a str,
 ) -> OpenAiEmbedRequest<'a> {
@@ -947,7 +991,7 @@ pub(crate) fn embed_request_body<'a>(
     }
 }
 
-pub(crate) fn embed_response_into(raw: OpenAiEmbedResponse) -> EmbeddingResponse {
+pub fn embed_response_into(raw: OpenAiEmbedResponse) -> EmbeddingResponse {
     let OpenAiEmbedResponse {
         object,
         model,
@@ -972,25 +1016,19 @@ pub(crate) fn embed_response_into(raw: OpenAiEmbedResponse) -> EmbeddingResponse
 
 /// An OpenAI embeddings `usage` block as [`EmbeddingUsage`].
 pub fn embed_usage_into(usage: Option<OpenAiEmbedUsage>) -> EmbeddingUsage {
-    let (prompt_tokens, total_tokens, source) = match usage {
-        Some(usage) => {
-            let source = if usage.prompt_tokens.is_some() && usage.total_tokens.is_some() {
-                EmbeddingUsageSource::Reported
-            } else {
-                EmbeddingUsageSource::Unavailable
-            };
-            (
-                usage.prompt_tokens.unwrap_or_default(),
-                usage.total_tokens.unwrap_or_default(),
-                source,
-            )
-        }
-        None => (0, 0, EmbeddingUsageSource::Unavailable),
+    let usage = usage.unwrap_or_default();
+    let source = if usage.prompt_tokens.is_some() && usage.total_tokens.is_some() {
+        EmbeddingUsageSource::Reported
+    } else {
+        EmbeddingUsageSource::Unavailable
     };
+    let total_tokens = usage.total_tokens.unwrap_or_default();
     EmbeddingUsage {
-        prompt_tokens,
+        prompt_tokens: usage.prompt_tokens.unwrap_or_default(),
         total_tokens,
         upstream_total_tokens: total_tokens,
+        prompt_reported: usage.prompt_tokens.is_some(),
+        total_reported: usage.total_tokens.is_some(),
         source,
     }
 }
@@ -1931,38 +1969,47 @@ mod tests {
         );
     }
 
-    /// A client-supplied `stream_options` wins verbatim — the typed
-    /// injection must not duplicate or override it.
+    /// A client-supplied `stream_options` still asks the upstream for
+    /// usage (AISIX-Cloud#2028): `include_usage` is forced to `true`, the
+    /// object's other keys survive, a non-object is replaced, and the key
+    /// reaches the wire exactly once.
     #[test]
-    fn build_request_respects_client_stream_options() {
-        let mut extra = serde_json::Map::new();
-        extra.insert(
-            "stream_options".into(),
-            serde_json::json!({"include_usage": false}),
-        );
-        let req = ChatFormat {
-            gateway_strict_schema: false,
-            top_k: None,
-            thinking_budget_tokens: None,
-            thoughts_requested: false,
-            model: "m".into(),
-            messages: vec![],
-            temperature: None,
-            top_p: None,
-            max_tokens: None,
-            stream: Some(true),
-            extra,
-        };
-        let msgs = messages_from(&req, DeveloperRoleMode::Preserve);
-        let raw = serde_json::to_string(&build_request(&req, "gpt-4o", &msgs, true)).unwrap();
-        // Exactly one stream_options key on the wire (flatten + typed
-        // field would double-emit if both were set).
-        assert_eq!(raw.matches("stream_options").count(), 1);
-        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(
-            json["stream_options"],
-            serde_json::json!({"include_usage": false})
-        );
+    fn build_request_forces_include_usage_over_client_stream_options() {
+        for (client, expected) in [
+            (
+                serde_json::json!({"include_usage": false, "continuous_usage_stats": true}),
+                serde_json::json!({"include_usage": true, "continuous_usage_stats": true}),
+            ),
+            (
+                serde_json::json!({}),
+                serde_json::json!({"include_usage": true}),
+            ),
+            (
+                serde_json::Value::Null,
+                serde_json::json!({"include_usage": true}),
+            ),
+        ] {
+            let mut extra = serde_json::Map::new();
+            extra.insert("stream_options".into(), client.clone());
+            let req = ChatFormat {
+                gateway_strict_schema: false,
+                top_k: None,
+                thinking_budget_tokens: None,
+                thoughts_requested: false,
+                model: "m".into(),
+                messages: vec![],
+                temperature: None,
+                top_p: None,
+                max_tokens: None,
+                stream: Some(true),
+                extra,
+            };
+            let msgs = messages_from(&req, DeveloperRoleMode::Preserve);
+            let raw = serde_json::to_string(&build_request(&req, "gpt-4o", &msgs, true)).unwrap();
+            assert_eq!(raw.matches("stream_options").count(), 1, "client {client}");
+            let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(json["stream_options"], expected, "client {client}");
+        }
     }
 
     /// Non-streaming requests must not carry stream_options at all —

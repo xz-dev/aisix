@@ -178,7 +178,11 @@ pub struct EtcdConfig {
     pub dial_timeout_ms: Option<u64>,
     /// Bound on a single request/response etcd call, in milliseconds.
     /// Unset — the default — and `0` both mean unbounded (see the note on
-    /// `0` below).
+    /// `0` below), except the watch-create handshake, which then gets four
+    /// `dial_budget`s (at least 30 s), and a count-only point read of
+    /// `<prefix>/aisix-liveness-probe` that precedes the unbounded reads
+    /// under the same bound. With `dial_timeout_ms: 0` as well, those are
+    /// unbounded too.
     ///
     /// When set it covers the configuration range read (`load_all`), the
     /// watch-create handshake, and the admin surface's reads — including
@@ -772,6 +776,10 @@ pub struct ProxyConfig {
     /// Omitted, the default, uses the parallelism available to the
     /// process, which follows the CPU limits applied by a container
     /// runtime, cgroup, or `taskset`. Must be at least 1.
+    ///
+    /// Also sizes the token-estimate pool: one thread per worker, each holding
+    /// one tokenizer instance per encoding it has counted with (about 17 MiB
+    /// for cl100k, 27 MiB for o200k, 39 MiB for o200k_harmony).
     ///
     /// Applied at startup. Changing it requires a restart.
     #[serde(default)]
@@ -1432,23 +1440,19 @@ pub struct MetricsConfig {
     /// Environment variables accept the whole map as one JSON object.
     #[serde(default, deserialize_with = "deserialize_metric_labels")]
     pub labels: std::collections::BTreeMap<String, Vec<String>>,
-    /// Operator-defined User-Agent → `client_type` mapping rules
-    /// (AISIX-Cloud#1045), consulted BEFORE the built-in allowlist so a
-    /// deployment can classify in-house tools (or re-bucket a built-in
-    /// match). Deployment-scoped on purpose: the labels these rules mint
-    /// go to this DP's own Prometheus scrape surface, so the operator who
-    /// owns the scrape owns the label set. Order matters (first match
-    /// wins); compiled + validated at boot (fail-fast), never hot-reloaded.
+    /// Ordered User-Agent rules for the client classification in usage
+    /// events, observability exports, and the by-client token metric.
+    /// The first matching rule takes precedence over built-in clients.
+    /// The gateway validates and compiles the rules at startup.
     ///
     /// Env-only deployments set the whole list as one JSON array:
     /// `AISIX_OBSERVABILITY__METRICS__CLIENT_TYPE_RULES='[{"pattern":"^py-bill/","client":"billing"}]'`.
     #[serde(default, deserialize_with = "deserialize_client_type_rules")]
     pub client_type_rules: Vec<ClientTypeRule>,
     /// Operator overrides for the histogram bucket edges
-    /// (AISIX-Cloud#1226). Deployment-scoped for the same reason as
-    /// `client_type_rules`: the series these edges mint go to this DP's
-    /// own Prometheus scrape surface. Validated at boot (fail-fast),
-    /// never hot-reloaded.
+    /// (AISIX-Cloud#1226). These edges apply to the gateway's own
+    /// Prometheus scrape surface. Validated at boot (fail-fast), never
+    /// hot-reloaded.
     pub buckets: HistogramBucketsConfig,
 }
 
@@ -1498,11 +1502,10 @@ pub struct HistogramBucketsConfig {
     pub a2a_ttfb: Option<Vec<f64>>,
 }
 
-/// One `client_type_rules` entry: a regex tried against the raw inbound
-/// `User-Agent` (case-insensitive, unanchored — anchor with `^` yourself),
-/// and the bounded label value emitted on match. The label — not the UA —
-/// becomes the Prometheus `client_type` value, so cardinality stays capped
-/// by the rule count.
+/// One rule matches the inbound `User-Agent` after removing control
+/// characters and capping it at 256 characters. The regex is
+/// case-insensitive and unanchored by default. A match emits the rule's
+/// fixed `client` value as `client_type`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ClientTypeRule {

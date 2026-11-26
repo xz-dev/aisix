@@ -331,49 +331,36 @@ fn rate_limit_policy_corpus() {
 
 #[test]
 fn provider_key_corpus() {
-    // Corpus fixtures deliberately keep the credential's former `secret`
-    // spelling — they double as acceptance proof for stored documents
-    // written before the field's rename to `api_key`. The canonical
-    // spelling is pinned by the dedicated cases below.
     check(
         "provider_key",
         validate_provider_key,
         &[
             (
-                "minimal (former `secret` spelling)",
-                true,
-                json!({"display_name": "openai-prod", "secret": "sk-x"}),
-            ),
-            (
-                "minimal (canonical `api_key` spelling)",
+                "minimal",
                 true,
                 json!({"display_name": "openai-prod", "api_key": "sk-x"}),
             ),
             (
+                "retired `secret` spelling",
+                false,
+                json!({"display_name": "openai-prod", "secret": "sk-x"}),
+            ),
+            (
                 "with api_base + provider",
                 true,
-                json!({"display_name": "p", "secret": "sk-x", "api_base": "https://api.openai.com/v1", "provider": "deepseek"}),
+                json!({"display_name": "p", "api_key": "sk-x", "api_base": "https://api.openai.com/v1", "provider": "deepseek"}),
             ),
-            ("missing display_name", false, json!({"secret": "sk-x"})),
-            (
-                "credential absent under both spellings",
-                false,
-                json!({"display_name": "x"}),
-            ),
-            (
-                "both credential spellings (schema layer admits; serde rejects the duplicate)",
-                true,
-                json!({"display_name": "x", "api_key": "a", "secret": "b"}),
-            ),
+            ("missing display_name", false, json!({"api_key": "sk-x"})),
+            ("missing api_key", false, json!({"display_name": "x"})),
             (
                 "unknown top-level field",
                 false,
-                json!({"display_name": "x", "secret": "k", "rogue": 1}),
+                json!({"display_name": "x", "api_key": "k", "rogue": 1}),
             ),
             (
                 "empty display_name",
                 false,
-                json!({"display_name": "", "secret": "k"}),
+                json!({"display_name": "", "api_key": "k"}),
             ),
             (
                 "empty api_key",
@@ -381,101 +368,96 @@ fn provider_key_corpus() {
                 json!({"display_name": "x", "api_key": ""}),
             ),
             (
-                "empty secret",
-                false,
-                json!({"display_name": "x", "secret": ""}),
-            ),
-            (
                 "adapter azure-openai",
                 true,
-                json!({"display_name": "x", "secret": "k", "adapter": "azure-openai"}),
+                json!({"display_name": "x", "api_key": "k", "adapter": "azure-openai"}),
             ),
             (
                 "adapter invalid",
                 false,
-                json!({"display_name": "x", "secret": "k", "adapter": "not-a-real-adapter"}),
+                json!({"display_name": "x", "api_key": "k", "adapter": "not-a-real-adapter"}),
             ),
             // option_add_null_type=true: optional fields accept explicit null.
             (
                 "adapter null",
                 true,
-                json!({"display_name": "x", "secret": "k", "adapter": null}),
+                json!({"display_name": "x", "api_key": "k", "adapter": null}),
             ),
             (
                 "telemetry catalog",
                 true,
-                json!({"display_name": "x", "secret": "k", "telemetry_tags": {"kind": "catalog", "featured": true, "branded_provider": "deepseek", "pk_label": "prod"}}),
+                json!({"display_name": "x", "api_key": "k", "telemetry_tags": {"kind": "catalog", "featured": true, "branded_provider": "deepseek", "pk_label": "prod"}}),
             ),
             (
                 "telemetry byo, branded omitted",
                 true,
-                json!({"display_name": "x", "secret": "k", "telemetry_tags": {"kind": "byo", "byo_label": "platform-team"}}),
+                json!({"display_name": "x", "api_key": "k", "telemetry_tags": {"kind": "byo", "byo_label": "platform-team"}}),
             ),
             // The load-bearing nullable case: cp-api sends branded_provider:null.
             (
                 "telemetry branded_provider null",
                 true,
-                json!({"display_name": "x", "secret": "k", "telemetry_tags": {"branded_provider": null}}),
+                json!({"display_name": "x", "api_key": "k", "telemetry_tags": {"branded_provider": null}}),
             ),
             (
                 "telemetry unknown tag",
                 false,
-                json!({"display_name": "x", "secret": "k", "telemetry_tags": {"unknown_tag": "v"}}),
+                json!({"display_name": "x", "api_key": "k", "telemetry_tags": {"unknown_tag": "v"}}),
             ),
             (
                 "telemetry kind invalid (closed enum)",
                 false,
-                json!({"display_name": "x", "secret": "k", "telemetry_tags": {"kind": "third-party"}}),
+                json!({"display_name": "x", "api_key": "k", "telemetry_tags": {"kind": "third-party"}}),
             ),
             (
                 "request empty",
                 true,
-                json!({"display_name": "x", "secret": "k", "request": {}}),
+                json!({"display_name": "x", "api_key": "k", "request": {}}),
             ),
             (
                 "request full",
                 true,
-                json!({"display_name": "x", "secret": "k", "request": {"param_renames": {"max_completion_tokens": "max_tokens"}, "param_constraints": {"temperature_max": 1.0}, "default_headers": {"X-Foo": "bar"}, "default_body_fields": {"safe_prompt": true}}}),
+                json!({"display_name": "x", "api_key": "k", "request": {"param_renames": {"max_completion_tokens": "max_tokens"}, "param_constraints": {"temperature_max": 1.0}, "default_headers": {"X-Foo": "bar"}, "default_body_fields": {"safe_prompt": true}}}),
             ),
             (
                 "request typo field",
                 false,
-                json!({"display_name": "x", "secret": "k", "request": {"param_rename": {}}}),
+                json!({"display_name": "x", "api_key": "k", "request": {"param_rename": {}}}),
             ),
             (
                 "param_constraints unknown field",
                 false,
-                json!({"display_name": "x", "secret": "k", "request": {"param_constraints": {"top_p_max": 0.9}}}),
+                json!({"display_name": "x", "api_key": "k", "request": {"param_constraints": {"top_p_max": 0.9}}}),
             ),
             (
                 "response full",
                 true,
-                json!({"display_name": "x", "secret": "k", "response": {"stream_done_marker": "none", "content_list_to_string": false, "error_envelope": "openai", "reasoning_field": "delta.reasoning_content"}}),
+                json!({"display_name": "x", "api_key": "k", "response": {"stream_done_marker": "none", "content_list_to_string": false, "error_envelope": "openai", "reasoning_field": "delta.reasoning_content"}}),
             ),
             (
                 "response bad stream_done_marker",
                 false,
-                json!({"display_name": "x", "secret": "k", "response": {"stream_done_marker": "maybe"}}),
+                json!({"display_name": "x", "api_key": "k", "response": {"stream_done_marker": "maybe"}}),
             ),
             (
                 "response stream_done_marker case-sensitive",
                 false,
-                json!({"display_name": "x", "secret": "k", "response": {"stream_done_marker": "Required"}}),
+                json!({"display_name": "x", "api_key": "k", "response": {"stream_done_marker": "Required"}}),
             ),
             (
                 "response typo field",
                 false,
-                json!({"display_name": "x", "secret": "k", "response": {"reasoning_fields": "x"}}),
+                json!({"display_name": "x", "api_key": "k", "response": {"reasoning_fields": "x"}}),
             ),
             (
                 "strip_headers empty",
                 true,
-                json!({"display_name": "x", "secret": "k", "strip_headers": []}),
+                json!({"display_name": "x", "api_key": "k", "strip_headers": []}),
             ),
             (
                 "strip_headers non-string item",
                 false,
-                json!({"display_name": "x", "secret": "k", "strip_headers": [1, 2]}),
+                json!({"display_name": "x", "api_key": "k", "strip_headers": [1, 2]}),
             ),
         ],
     );
@@ -1056,7 +1038,11 @@ fn published_strict_schemas_are_what_the_write_path_compiles() {
 ///   semantic thresholds' `default: 0.75`). `script` itself is required on
 ///   BOTH sets.
 const EXTRA_RELAXATIONS: &[(&str, &[&str])] = &[
-    ("budget", &["/allOf"]),
+    (
+        "budget",
+        &["/allOf", "/definitions/BudgetExhausted/dependencies"],
+    ),
+    ("usage_accounting", &["/required"]),
     (
         "api_key",
         &[
@@ -1098,13 +1084,7 @@ const EXTRA_RELAXATIONS: &[(&str, &[&str])] = &[
             "/required",
         ],
     ),
-    (
-        "mcp_server",
-        &[
-            "/properties/display_name/pattern",
-            "/properties/name/pattern",
-        ],
-    ),
+    ("mcp_server", &["/properties/name/pattern"]),
     (
         "oidc_provider",
         &[
@@ -1181,229 +1161,6 @@ const EXTRA_RELAXATIONS: &[(&str, &[&str])] = &[
         ],
     ),
 ];
-
-/// Every field the resources file refuses as an id-form model reference
-/// is a field this build's schema actually declares.
-///
-/// The refusal list (`filesource::model_ref_id_fields`) is written by
-/// hand, and `aisix export` rewrites the same list back to name form. A
-/// typo in either half is silent in both directions: the file would
-/// accept an id that resolves to nothing, and the export would leave one
-/// in a file that then refuses to load. Neither shows up as a test
-/// failure anywhere else, because a name nothing declares simply never
-/// matches.
-#[test]
-fn every_refused_model_reference_id_is_a_declared_field() {
-    fn declares(node: &Value, field: &str) -> bool {
-        match node {
-            Value::Object(map) => {
-                map.get("properties")
-                    .and_then(Value::as_object)
-                    .is_some_and(|p| p.contains_key(field))
-                    || map.values().any(|v| declares(v, field))
-            }
-            Value::Array(items) => items.iter().any(|v| declares(v, field)),
-            _ => false,
-        }
-    }
-
-    // (resources-file collection, the resource whose schema declares it)
-    for (kind, resource) in [
-        ("api_keys", "api_key"),
-        ("models", "model"),
-        ("cache_policies", "cache_policy"),
-        ("guardrails", "guardrail"),
-    ] {
-        let schema = resource_root_schema(resource, true);
-        let fields = aisix_core::filesource::model_ref_id_fields(kind);
-        assert!(
-            !fields.is_empty(),
-            "{kind} has model references but refuses none"
-        );
-        for reference in fields {
-            let (id_field, name_field) = (reference.field, reference.name_field);
-            assert!(
-                declares(&schema, id_field),
-                "{kind} refuses `{id_field}`, which the {resource} schema does not declare"
-            );
-            assert!(
-                declares(&schema, name_field),
-                "{kind} rewrites `{id_field}` to `{name_field}`, which the {resource} schema \
-                 does not declare"
-            );
-            // The hint is what an operator is told to write instead, so it
-            // has to START with the name field — a hint naming a different
-            // field would send them somewhere the reference does not live.
-            assert!(
-                reference.hint.starts_with(name_field),
-                "{kind}'s hint for `{id_field}` ({:?}) does not name `{name_field}`",
-                reference.hint
-            );
-        }
-    }
-}
-
-/// The same check for the OTHER reference with an id spelling: every
-/// field the resources file refuses as an id-form MCP server reference,
-/// and every name field it points the operator at, is one this build's
-/// schema actually declares.
-///
-/// `filesource::mcp_ref_id_fields` is hand-written per collection and
-/// `aisix export` rewrites the same list back to the name form, so a typo
-/// in either half is silent in both directions — the file would accept an
-/// id that resolves to nothing, and the export would emit one into a file
-/// that then refuses to load.
-#[test]
-fn every_refused_mcp_reference_id_is_a_declared_field() {
-    /// The object `path` names, walked from the schema root through
-    /// `properties`, following a `$ref` into `definitions` at each step.
-    ///
-    /// Walked rather than searched, because `path` is exactly as
-    /// typo-prone as the field names beside it and a whole-document
-    /// search cannot see it: `mcp_ref_id_field` navigates the DOCUMENT by
-    /// that path, so a path naming no object makes the refusal silently
-    /// never fire — the file then loads a ceiling built from
-    /// control-plane ids, which resolves to nothing, with the name form
-    /// beside it unread.
-    fn object_at<'a>(schema: &'a Value, path: &[&str]) -> Option<&'a Value> {
-        let mut node = schema;
-        for segment in path {
-            let property = node.get("properties")?.get(segment)?;
-            node = resolve_ref(schema, property)?;
-        }
-        Some(node)
-    }
-
-    /// Follow one indirection into `definitions`: a bare `$ref`, or the
-    /// single `$ref` branch of the `allOf` / `anyOf` wrapper `schemars`
-    /// emits for a described or nullable field.
-    fn resolve_ref<'a>(schema: &'a Value, node: &'a Value) -> Option<&'a Value> {
-        let referenced = node.get("$ref").or_else(|| {
-            ["allOf", "anyOf", "oneOf"]
-                .iter()
-                .filter_map(|k| node.get(k))
-                .filter_map(Value::as_array)
-                .find_map(|branches| branches.iter().find_map(|b| b.get("$ref")))
-        });
-        match referenced.and_then(Value::as_str) {
-            Some(pointer) => schema.pointer(pointer.trim_start_matches('#')),
-            None => Some(node),
-        }
-    }
-
-    // (resources-file collection, the resource whose schema declares it)
-    for (kind, resource) in [
-        ("api_keys", "api_key"),
-        ("mcp_auth_settings", "mcp_auth_settings"),
-    ] {
-        let schema = resource_root_schema(resource, true);
-        let fields = aisix_core::filesource::mcp_ref_id_fields(kind);
-        assert!(
-            !fields.is_empty(),
-            "{kind} carries MCP server references but refuses none"
-        );
-        for reference in fields {
-            let (path, id_field, name_field) =
-                (reference.path, reference.field, reference.name_field);
-            let holder = object_at(&schema, path).unwrap_or_else(|| {
-                panic!(
-                    "{kind} refuses `{id_field}` under path {path:?}, which the {resource} \
-                     schema declares no object at"
-                )
-            });
-            let declares = |field: &str| {
-                holder
-                    .get("properties")
-                    .and_then(Value::as_object)
-                    .is_some_and(|p| p.contains_key(field))
-            };
-            assert!(
-                declares(id_field),
-                "{kind} refuses `{id_field}`, which the {resource} schema does not declare at \
-                 {path:?}"
-            );
-            assert!(
-                declares(name_field),
-                "{kind} rewrites `{id_field}` to `{name_field}`, which the {resource} schema \
-                 does not declare at {path:?}"
-            );
-        }
-    }
-}
-
-/// Every `<name>` / `<name>_id` pair a resource declares is registered as
-/// a model reference.
-///
-/// The other direction of the check above, and the one that actually
-/// rots: a future site gains an id spelling, nobody adds it to
-/// `filesource::model_ref_id_fields`, and from then on the resources file
-/// SILENTLY accepts an id it can never resolve (with the name spelling
-/// ignored on top) while `aisix export` silently drops it. Nothing else
-/// notices, because a field no table mentions simply never matches.
-///
-/// Detected structurally rather than by name or by prose: a property
-/// ending `_id` (or `_ids`) whose name-form sibling is declared on the
-/// SAME object is the shape every model reference has. Sibling-less ids
-/// — `provider_key_id`, `team_id`, `user_id` — are not pairs and are not
-/// reported. A reference whose name form is spelled differently
-/// (`applies_to_model_id` → `applies_to`) cannot be found this way, which
-/// is why it is registered by hand; this check only ever demands MORE
-/// registration, never less.
-#[test]
-fn every_declared_name_and_id_pair_is_registered_as_a_model_reference() {
-    /// The name-form sibling `field` would pair with, if any.
-    fn name_form(field: &str) -> Option<String> {
-        if let Some(stem) = field.strip_suffix("_ids") {
-            return Some(format!("{stem}s"));
-        }
-        field.strip_suffix("_id").map(str::to_owned)
-    }
-
-    fn collect_pairs(node: &Value, out: &mut Vec<String>) {
-        match node {
-            Value::Object(map) => {
-                if let Some(Value::Object(properties)) = map.get("properties") {
-                    for field in properties.keys() {
-                        if name_form(field).is_some_and(|n| properties.contains_key(&n)) {
-                            out.push(field.clone());
-                        }
-                    }
-                }
-                for child in map.values() {
-                    collect_pairs(child, out);
-                }
-            }
-            Value::Array(items) => {
-                for item in items {
-                    collect_pairs(item, out);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    for (kind, resource) in [
-        ("api_keys", "api_key"),
-        ("models", "model"),
-        ("cache_policies", "cache_policy"),
-        ("guardrails", "guardrail"),
-    ] {
-        let mut found = Vec::new();
-        collect_pairs(&resource_root_schema(resource, true), &mut found);
-        found.sort();
-        found.dedup();
-        let registered = aisix_core::filesource::model_ref_id_fields(kind);
-        for field in found {
-            assert!(
-                registered.iter().any(|r| r.field == field),
-                "the {resource} schema declares `{field}` beside its name form, but \
-                 `filesource::model_ref_id_fields(\"{kind}\")` does not list it — the \
-                 resources file would accept an id it can never resolve, and `aisix export` \
-                 would drop it"
-            );
-        }
-    }
-}
 
 /// The published files are exactly the ones `dump-schema` emits today.
 ///
@@ -1706,6 +1463,11 @@ const UNKNOWN_FIELD_TOLERANCE: &[Probe] = &[
         resource: "budget_policy",
         pointer: "",
         document: || json!({"fail_mode": "closed", "closed_grace_seconds": 300}),
+    },
+    Probe {
+        resource: "usage_accounting",
+        pointer: "",
+        document: || json!({"exclude_estimated_usage": true}),
     },
 ];
 

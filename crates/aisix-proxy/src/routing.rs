@@ -648,7 +648,9 @@ where
             api_key_id: auth.entry.id.as_str(),
             source_ip: &client.source_ip,
             context_origin: None,
+            gemini_target: None,
             budget: Some(&budget_gate),
+            client: Some(client),
         },
     )?;
     let routing = entry.value.routing.as_ref();
@@ -1466,15 +1468,21 @@ pub(crate) struct RoutingRequest<'a> {
     pub headers: Option<&'a HeaderMap>,
     pub api_key_id: &'a str,
     pub source_ip: &'a str,
-    /// Model id of the target that produced the context a `/v1/responses`
-    /// follow-up carries ([`crate::responses_affinity`]). When set, that
-    /// target and its provider-key peers are attempted first, ahead of the
-    /// strategy's order. `None` everywhere else.
-    pub context_origin: Option<&'a str>,
+    /// The target that produced the context a `/v1/responses` follow-up
+    /// carries ([`crate::responses_affinity`]). When set, the targets that
+    /// can read that context are attempted first, ahead of the strategy's
+    /// order. `None` everywhere else.
+    pub context_origin: Option<&'a crate::responses_affinity::Origin>,
+    /// On Gemini requests, only targets that can serve the generation
+    /// protocol participate in balancing and consume a fallback slot.
+    pub gemini_target: Option<&'a (dyn Fn(&Model) -> bool + Sync)>,
     /// The request's budget gate. A target whose provider key's budget is
     /// exhausted is not a candidate, and a direct model on one is refused.
     /// `None` only in tests that exercise no budget.
     pub budget: Option<&'a crate::budget::BudgetGate>,
+    /// The caller, for a semantic router's classifier call to render the
+    /// request headers a direct call renders. `None` only in tests.
+    pub client: Option<&'a crate::client_ip::ClientContext>,
 }
 
 /// Drop the targets whose own `allowed_cidrs` excludes `source_ip`.
@@ -1563,6 +1571,12 @@ pub(crate) fn resolve_attempt_models(
     req: RoutingRequest<'_>,
 ) -> Result<Vec<AttemptModel>, ProxyError> {
     let Some(routing) = virtual_model.routing.as_ref() else {
+        if req
+            .gemini_target
+            .is_some_and(|admits| !admits(virtual_model))
+        {
+            return Err(crate::gemini::unsupported_target());
+        }
         if let Some(gate) = req.budget {
             gate.check_model(virtual_model)?;
         }
@@ -1639,10 +1653,21 @@ pub(crate) fn resolve_attempt_models(
     // exhausted is not a candidate either, for the same reasons as the IP
     // allowlist — it must not consume a `max_fallbacks` slot, and it has no
     // "try anyway".
-    let eligible = match req.budget {
+    let mut eligible = match req.budget {
         Some(gate) => targets_within_budget(snapshot, gate, eligible)?,
         None => eligible,
     };
+    if let Some(admits) = req.gemini_target {
+        eligible.retain(|t| {
+            snapshot
+                .models
+                .get_by_name(&t.model)
+                .is_none_or(|e| admits(&e.value))
+        });
+        if eligible.is_empty() {
+            return Err(crate::gemini::unsupported_target());
+        }
+    }
     let filtered_routing = Routing {
         targets: eligible,
         ..routing.clone()
@@ -1700,7 +1725,7 @@ pub(crate) fn resolve_attempt_models(
         resolved = pin_context_origin(snapshot, runtime_status, routing, resolved, origin);
         tracing::debug!(
             virtual_model = %virtual_name,
-            origin,
+            origin = %origin.model_id,
             first = resolved.first().map(|a| a.model.display_name.as_str()),
             "responses context affinity reordered routing candidates",
         );
@@ -1731,8 +1756,9 @@ pub(crate) fn resolve_attempt_models(
 }
 
 /// Put the targets that can read a conversation's context first: the origin
-/// target, then the other targets on its provider key, then the rest in the
-/// strategy's order. Targets the strategy left out of `resolved` (its
+/// target whenever it is a candidate, then the other targets inside the
+/// [`crate::responses_affinity::Boundary`] in the strategy's order, then the
+/// rest. Targets the strategy left out of `resolved` (its
 /// `max_fallbacks` cut) are brought back behind the ones it ordered, since
 /// the pinned order can push those out and the cut is applied again after
 /// this. Only targets that survived the tag and client-IP filters are
@@ -1745,7 +1771,7 @@ fn pin_context_origin(
     runtime_status: &crate::ModelRuntimeStatusTracker,
     routing: &Routing,
     resolved: Vec<AttemptModel>,
-    origin: &str,
+    origin: &crate::responses_affinity::Origin,
 ) -> Vec<AttemptModel> {
     let boundary = crate::responses_affinity::Boundary::of(snapshot, origin);
     let mut candidates = resolved;
@@ -2139,7 +2165,7 @@ mod tests {
         strategy: RoutingStrategy,
         targets: &[&str],
         max_fallbacks: Option<u32>,
-        origin: &str,
+        origin: &crate::responses_affinity::Origin,
     ) -> Vec<String> {
         let mut group: Model = serde_json::from_value(serde_json::json!({
             "display_name": "group",
@@ -2181,7 +2207,7 @@ mod tests {
                 RoutingStrategy::Failover,
                 &["c", "a", "b", "a2"],
                 None,
-                "id-a2"
+                &crate::responses_affinity::Origin::model("id-a2")
             ),
             ["a2", "a", "c", "b"],
         );
@@ -2193,9 +2219,30 @@ mod tests {
                 RoutingStrategy::Failover,
                 &["c", "b", "a2"],
                 Some(1),
-                "id-a"
+                &crate::responses_affinity::Origin::model("id-a")
             ),
             ["a2", "c"],
+        );
+    }
+
+    #[test]
+    fn the_origin_goes_first_after_its_key_changed() {
+        // The context was served by `a` on pk-1; `a` has since moved to pk-2.
+        let snap = pk_snapshot(&[("c", "pk-3"), ("b", "pk-1"), ("a", "pk-2"), ("a2", "pk-2")]);
+        let status = crate::ModelRuntimeStatusTracker::new();
+        assert_eq!(
+            pinned_order(
+                &snap,
+                &status,
+                RoutingStrategy::Failover,
+                &["c", "b", "a", "a2"],
+                None,
+                &crate::responses_affinity::Origin {
+                    model_id: "id-a".into(),
+                    key: Some("pk-1".into()),
+                }
+            ),
+            ["a", "b", "a2", "c"],
         );
     }
 
@@ -2212,7 +2259,7 @@ mod tests {
                 RoutingStrategy::Failover,
                 &["a", "a2", "c"],
                 Some(1),
-                "id-a"
+                &crate::responses_affinity::Origin::model("id-a")
             ),
             ["c"],
         );

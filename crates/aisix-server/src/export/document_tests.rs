@@ -1,1588 +1,634 @@
 use super::*;
-use aisix_core::resource::ResourceEntry;
+use aisix_etcd::{build_snapshot, PrefixSet, RawEntry, WatchedPrefix};
 use serde_json::json;
 
-fn provider_key(display_name: &str, api_key: &str) -> aisix_core::models::ProviderKey {
-    serde_json::from_value(json!({"display_name": display_name, "api_key": api_key})).unwrap()
+const PK: &str = "0b6f3c1e-2f0a-4c5e-9d55-7d1a8b0c2e11";
+const MODEL: &str = "6efd592d-a73b-573d-8e2c-e9e103692f92";
+const KEY: &str = "4a1c9e2b-7d3f-4b6a-8c5e-1f2a3b4c5d6e";
+const POLICY: &str = "9e8d7c6b-5a4f-4e3d-8c2b-1a0f9e8d7c6b";
+const GONE: &str = "00000000-0000-4000-8000-000000000000";
+
+/// A snapshot decoded from etcd rows, the way `aisix export` builds it.
+fn snapshot(rows: &[(&str, &str, Value)]) -> AisixSnapshot {
+    let entries: Vec<RawEntry> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, (kind, id, value))| RawEntry {
+            key: format!("/aisix/{kind}/{id}"),
+            value: serde_json::to_vec(value).unwrap(),
+            revision: i as i64 + 1,
+        })
+        .collect();
+    let prefixes = PrefixSet::new(vec![WatchedPrefix::environment("/aisix")]);
+    let (snap, stats) = build_snapshot(&prefixes, &entries);
+    assert!(stats.rejections.is_empty(), "{:?}", stats.rejections);
+    snap
 }
 
-fn model_value(json: Value) -> aisix_core::models::Model {
-    serde_json::from_value(json).unwrap()
+/// Export `rows` as `aisix export` does: the stored documents, filtered by
+/// what the loader accepted.
+fn export(rows: &[(&str, &str, Value)], reveal: bool) -> ExportDocument {
+    let raw: RawDocs = rows
+        .iter()
+        .map(|(kind, id, value)| {
+            let Value::Object(doc) = value.clone() else {
+                unreachable!()
+            };
+            ((kind.to_string(), id.to_string()), doc)
+        })
+        .collect();
+    build_export_document(&snapshot(rows), &raw, reveal)
 }
 
 fn find<'a>(doc: &'a ExportDocument, kind: &str) -> &'a [Value] {
     doc.collections
         .iter()
         .find(|(k, _)| *k == kind)
-        .map(|(_, v)| v.as_slice())
-        .unwrap_or(&[])
+        .map(|(_, entries)| entries.as_slice())
+        .unwrap_or_else(|| panic!("no {kind} collection"))
+}
+
+fn rows() -> Vec<(&'static str, &'static str, Value)> {
+    vec![
+        (
+            "provider_keys",
+            PK,
+            json!({"display_name": "openai-prod", "provider": "openai", "api_key": "sk-live"}),
+        ),
+        (
+            "models",
+            MODEL,
+            json!({
+                "display_name": "gpt-4o",
+                "provider": "openai",
+                "model_name": "gpt-4o-2024-11-20",
+                "provider_key_id": PK
+            }),
+        ),
+        (
+            "api_keys",
+            KEY,
+            json!({"key_hash": "ab".repeat(32), "allowed_model_ids": [MODEL]}),
+        ),
+        (
+            "cache_policies",
+            POLICY,
+            json!({"name": "per-key", "applies_to": format!("api_key:{KEY}"), "ttl_seconds": 60}),
+        ),
+    ]
 }
 
 #[test]
-fn provider_key_ref_resugars_to_name() {
-    let snap = AisixSnapshot::new();
-    snap.provider_keys.insert(ResourceEntry::new(
-        "pk-uuid-1",
-        provider_key("openai-prod", "sk-live"),
-        1,
-    ));
-    snap.models.insert(ResourceEntry::new(
-        "m-uuid-1",
-        model_value(json!({
-            "display_name": "gpt-4o",
-            "provider": "openai",
-            "model_name": "gpt-4o-2024-11-20",
-            "provider_key_id": "pk-uuid-1"
-        })),
-        1,
-    ));
-
-    let doc = build_export_document(&snap, false);
-    let models = find(&doc, "models");
-    assert_eq!(models.len(), 1);
-    // Canonical id reference gone; file name sugar in its place.
-    assert!(models[0].get("provider_key_id").is_none());
-    assert_eq!(models[0]["provider_key"], json!("openai-prod"));
-}
-
-/// A classifier's key reference resugars to a name, like a model's.
-#[test]
-fn classifier_provider_key_ref_resugars_to_name() {
-    let snap = AisixSnapshot::new();
-    snap.provider_keys.insert(ResourceEntry::new(
-        "pk-uuid-ts",
-        provider_key("typesafe-prod", "ts-live"),
-        1,
-    ));
-    let router = |pk: &str| {
-        model_value(json!({
-            "display_name": "jev-router",
-            "semantic": {
-                "classifier": {"type": "jev", "provider_key_id": pk},
-                "routes": [{"name": "code", "target": "m", "description": "code"}],
-                "default": "m"
-            }
-        }))
-    };
-    snap.models
-        .insert(ResourceEntry::new("m-uuid-r", router("pk-uuid-ts"), 1));
-    let doc = build_export_document(&snap, false);
-    let classifier = &find(&doc, "models")[0]["semantic"]["classifier"];
-    assert!(classifier.get("provider_key_id").is_none());
-    assert_eq!(classifier["provider_key"], json!("typesafe-prod"));
-    assert!(doc.blocking.is_empty(), "{:?}", doc.blocking);
-
-    let snap = AisixSnapshot::new();
-    snap.models
-        .insert(ResourceEntry::new("m-uuid-r", router("pk-gone"), 1));
-    let doc = build_export_document(&snap, false);
-    assert_eq!(
-        find(&doc, "models")[0]["semantic"]["classifier"]["provider_key_id"],
-        json!("pk-gone")
-    );
-    assert!(
-        doc.blocking
-            .iter()
-            .any(|w| w.contains("jev-router") && w.contains("pk-gone")),
-        "{:?}",
-        doc.blocking
-    );
-}
-
-#[test]
-fn dangling_provider_key_ref_is_kept_and_warned() {
-    let snap = AisixSnapshot::new();
-    snap.models.insert(ResourceEntry::new(
-        "m-uuid-1",
-        model_value(json!({
-            "display_name": "orphan",
-            "provider": "openai",
-            "model_name": "gpt-4o",
-            "provider_key_id": "pk-does-not-exist"
-        })),
-        1,
-    ));
-    let doc = build_export_document(&snap, false);
-    let models = find(&doc, "models");
-    assert_eq!(models[0]["provider_key_id"], json!("pk-does-not-exist"));
-    assert!(models[0].get("provider_key").is_none());
-    // A dangling provider_key_id makes the file non-loadable → blocking.
-    assert!(
-        doc.blocking
-            .iter()
-            .any(|w| w.contains("dangling") && w.contains("orphan")),
-        "{:?}",
-        doc.blocking
-    );
-}
-
-#[test]
-fn api_key_gets_synthetic_name_and_keeps_key_hash() {
-    let snap = AisixSnapshot::new();
-    let key_hash = "91ed2dbc407561556f3e7be98ba0bd2a57986d6a868c482d867d19c6d40d201c";
-    snap.apikeys.insert(ResourceEntry::new(
-        "k-uuid-1",
-        serde_json::from_value(json!({"key_hash": key_hash, "allowed_models": ["*"]})).unwrap(),
-        1,
-    ));
-    let doc = build_export_document(&snap, false);
-    let keys = find(&doc, "api_keys");
-    assert_eq!(keys.len(), 1);
-    assert_eq!(keys[0]["display_name"], json!("apikey-91ed2dbc40756155"));
-    // key_hash is already hashed — emitted verbatim, no placeholder.
-    assert_eq!(keys[0]["key_hash"], json!(key_hash));
-    assert!(doc.secret_placeholders.is_empty());
-}
-
-#[test]
-fn scope_ref_resolves_for_model_and_api_key_scopes() {
-    let snap = AisixSnapshot::new();
-    let key_hash = "aa".repeat(32);
-    snap.models.insert(ResourceEntry::new(
-            "m-uuid-1",
-            model_value(json!({"display_name": "gpt-4o", "provider": "openai", "model_name": "x", "provider_key_id": "pk"})),
-            1,
-        ));
-    snap.apikeys.insert(ResourceEntry::new(
-        "k-uuid-1",
-        serde_json::from_value(json!({"key_hash": key_hash, "allowed_models": ["*"]})).unwrap(),
-        1,
-    ));
-    snap.provider_keys
-        .insert(ResourceEntry::new("pk", provider_key("pk", "sk"), 1));
-    for (name, scope, scope_ref) in [
-        ("cap-model", "model", "m-uuid-1"),
-        ("cap-key", "api_key", "k-uuid-1"),
-        ("cap-team", "team", "team-uuid-9"),
-    ] {
-        snap.rate_limit_policies.insert(ResourceEntry::new(
-            format!("rlp-{name}"),
-            serde_json::from_value(json!({
-                "name": name, "scope": scope, "scope_ref": scope_ref,
-                "window": "minute", "max_requests": 10
-            }))
-            .unwrap(),
-            1,
-        ));
-    }
-
-    let doc = build_export_document(&snap, false);
-    let policies = find(&doc, "rate_limit_policies");
-    let by_name = |n: &str| policies.iter().find(|p| p["name"] == json!(n)).unwrap();
-    assert_eq!(by_name("cap-model")["scope_ref"], json!("gpt-4o"));
-    assert_eq!(
-        by_name("cap-key")["scope_ref"],
-        json!(synthetic_api_key_name(&"aa".repeat(32)))
-    );
-    // team scope passes through verbatim.
-    assert_eq!(by_name("cap-team")["scope_ref"], json!("team-uuid-9"));
-}
-
-#[test]
-fn duplicate_identity_within_a_kind_warns() {
-    let snap = AisixSnapshot::new();
-    // Two provider keys with the same display_name but distinct ids —
-    // possible in raw etcd, impossible in the file.
-    snap.provider_keys
-        .insert(ResourceEntry::new("pk-a", provider_key("dup", "sk-a"), 1));
-    snap.provider_keys
-        .insert(ResourceEntry::new("pk-b", provider_key("dup", "sk-b"), 1));
-    let doc = build_export_document(&snap, false);
-    // Duplicate identity makes the file non-loadable → blocking.
-    assert!(
-        doc.blocking
-            .iter()
-            .any(|w| w.contains("share the identity") && w.contains("dup")),
-        "{:?}",
-        doc.blocking
-    );
-}
-
-#[test]
-fn provider_key_request_default_headers_and_body_fields_are_redacted() {
-    let snap = AisixSnapshot::new();
-    let pk: aisix_core::models::ProviderKey = serde_json::from_value(json!({
-        "display_name": "pk",
-        "api_key": "sk-main-SECRET",
-        "request": {
-            "default_headers": { "x-tenant-token": "hdr-SECRET" },
-            "default_body_fields": { "api_key": "body-SECRET", "safe_prompt": true }
-        }
-    }))
-    .unwrap();
-    snap.provider_keys.insert(ResourceEntry::new("pk-1", pk, 1));
-    let doc = build_export_document(&snap, false);
-    let rendered = serde_json::to_string(&find(&doc, "provider_keys")).unwrap();
-    for secret in ["sk-main-SECRET", "hdr-SECRET", "body-SECRET"] {
-        assert!(!rendered.contains(secret), "leaked {secret}: {rendered}");
-    }
-    // Non-string body field preserved.
-    let pk_out = &find(&doc, "provider_keys")[0];
-    assert_eq!(
-        pk_out["request"]["default_body_fields"]["safe_prompt"],
-        json!(true)
-    );
-}
-
-#[test]
-fn cache_policy_api_key_applies_to_resugars_to_derived_id() {
-    use aisix_core::filesource::derive_id;
-    let snap = AisixSnapshot::new();
-    let key_hash = "cd".repeat(32);
-    snap.apikeys.insert(ResourceEntry::new(
-        "k-uuid-1",
-        serde_json::from_value(json!({"key_hash": key_hash, "allowed_models": ["*"]})).unwrap(),
-        1,
-    ));
-    snap.cache_policies.insert(ResourceEntry::new(
-        "cp-1",
-        serde_json::from_value(json!({"name": "cap-key", "applies_to": "api_key:k-uuid-1"}))
-            .unwrap(),
-        1,
-    ));
-    snap.cache_policies.insert(ResourceEntry::new(
-        "cp-2",
-        serde_json::from_value(json!({"name": "cap-model", "applies_to": "model:gpt-4o"})).unwrap(),
-        1,
-    ));
-    let doc = build_export_document(&snap, false);
-    let policies = find(&doc, "cache_policies");
-    let by_name = |n: &str| policies.iter().find(|p| p["name"] == json!(n)).unwrap();
-    // api_key id → the id the file loader will derive from the api key's
-    // synthesized name, so the policy still matches after reload.
-    let expected = format!(
-        "api_key:{}",
-        derive_id("api_keys", &synthetic_api_key_name(&"cd".repeat(32)))
-    );
-    assert_eq!(by_name("cap-key")["applies_to"], json!(expected));
-    // model scope matches by alias — unchanged.
-    assert_eq!(by_name("cap-model")["applies_to"], json!("model:gpt-4o"));
-}
-
-#[test]
-fn cache_policy_dangling_api_key_applies_to_is_kept_and_warned() {
-    let snap = AisixSnapshot::new();
-    snap.cache_policies.insert(ResourceEntry::new(
-        "cp-1",
-        serde_json::from_value(json!({"name": "orphan", "applies_to": "api_key:missing-uuid"}))
-            .unwrap(),
-        1,
-    ));
-    let doc = build_export_document(&snap, false);
+fn every_entry_carries_its_etcd_id_and_its_references_as_stored() {
+    let doc = export(&rows(), false);
+    assert_eq!(find(&doc, "provider_keys")[0]["id"], json!(PK));
+    let model = &find(&doc, "models")[0];
+    assert_eq!(model["id"], json!(MODEL));
+    assert_eq!(model["provider_key_id"], json!(PK));
+    assert!(model.get("provider_key").is_none());
+    let key = &find(&doc, "api_keys")[0];
+    assert_eq!(key["id"], json!(KEY));
+    assert_eq!(key["allowed_model_ids"], json!([MODEL]));
+    assert!(key.get("display_name").is_none(), "no name is synthesized");
     assert_eq!(
         find(&doc, "cache_policies")[0]["applies_to"],
-        json!("api_key:missing-uuid")
+        json!(format!("api_key:{KEY}"))
     );
-    assert!(
-        doc.warnings
-            .iter()
-            .any(|w| w.contains("dangling") && w.contains("orphan")),
-        "{:?}",
-        doc.warnings
-    );
+    assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
 }
 
 #[test]
-fn placeholder_env_var_collision_across_identities_warns() {
-    let snap = AisixSnapshot::new();
-    // Two provider keys whose display_names differ only in a character
-    // `sanitize` folds to `_` → the same derived env var.
-    snap.provider_keys.insert(ResourceEntry::new(
-        "pk-a",
-        provider_key("openai-prod", "sk-a"),
-        1,
-    ));
-    snap.provider_keys.insert(ResourceEntry::new(
-        "pk-b",
-        provider_key("openai.prod", "sk-b"),
-        1,
-    ));
-    let doc = build_export_document(&snap, false);
-    assert!(
-        doc.warnings
-            .iter()
-            .any(|w| w.contains("same environment variable")),
-        "{:?}",
-        doc.warnings
-    );
-}
+fn the_exported_file_loads_back_as_the_same_rows() {
+    let doc = export(&rows(), false);
+    let yaml = super::super::yaml_emit::emit_yaml(&doc).unwrap();
+    let env = |name: &str| {
+        (name == "AISIXSECRET_PROVIDER_KEY_OPENAI_PROD_API_KEY").then(|| "sk-live".to_string())
+    };
+    let entries = aisix_etcd::file_source::read_str(&yaml, "exported.yaml", 1, &env)
+        .unwrap_or_else(|e| panic!("{e}\n{yaml}"));
+    let (loaded, stats) = build_snapshot(&aisix_etcd::file_source::prefixes(), &entries);
+    assert!(stats.rejections.is_empty(), "{:?}", stats.rejections);
 
-#[test]
-fn default_export_emits_no_live_provider_secret() {
-    let snap = AisixSnapshot::new();
-    snap.provider_keys.insert(ResourceEntry::new(
-        "pk-1",
-        provider_key("openai-prod", "sk-super-secret-do-not-leak"),
-        1,
-    ));
-    let doc = build_export_document(&snap, false);
-    let pks = find(&doc, "provider_keys");
+    let model = loaded.models.get_by_id(MODEL).expect("model keeps its id");
+    assert_eq!(model.value.provider_key_id.as_deref(), Some(PK));
     assert_eq!(
-        pks[0]["api_key"],
+        loaded.provider_keys.get_by_id(PK).unwrap().value.api_key,
+        "sk-live"
+    );
+    let key = loaded.apikeys.get_by_id(KEY).expect("api key keeps its id");
+    assert_eq!(
+        key.value.allowed_model_ids.as_deref(),
+        Some([MODEL.to_string()].as_slice())
+    );
+    assert!(loaded.cache_policies.get_by_id(POLICY).is_some());
+}
+
+#[test]
+fn a_reference_to_an_id_not_exported_is_kept_and_warned() {
+    let mut rows = rows();
+    rows[1].2["provider_key_id"] = json!(GONE);
+    rows[2].2["allowed_model_ids"] = json!([MODEL, GONE]);
+    rows[3].2["applies_to"] = json!(format!("api_key:{GONE}"));
+    rows.push((
+        "rate_limit_policies",
+        "1b2c3d4e-5f60-4718-9a0b-1c2d3e4f5a6b",
+        json!({
+            "name": "cap",
+            "scope": "api_key",
+            "scope_ref": GONE,
+            "window": "minute",
+            "max_requests": 10
+        }),
+    ));
+    let doc = export(&rows, false);
+    assert_eq!(find(&doc, "models")[0]["provider_key_id"], json!(GONE));
+    let warnings = doc.warnings.join("\n");
+    for field in [
+        "`provider_key_id` references provider_keys",
+        "`allowed_model_ids[]` references models",
+        "`applies_to` references api_keys",
+        "`scope_ref` references api_keys",
+    ] {
+        assert!(
+            warnings.contains(field),
+            "missing {field:?} in:\n{warnings}"
+        );
+    }
+    assert_eq!(doc.warnings.len(), 4, "{warnings}");
+}
+
+#[test]
+fn a_dangling_attachment_scope_is_warned() {
+    let doc = export(
+        &[(
+            "guardrail_attachments",
+            POLICY,
+            json!({"guardrail_id": GONE, "scope_type": "model", "scope_id": MODEL, "priority": 1}),
+        )],
+        false,
+    );
+    let warnings = doc.warnings.join("\n");
+    assert!(
+        warnings.contains("`guardrail_id` references guardrails"),
+        "{warnings}"
+    );
+    assert!(
+        warnings.contains("`scope_id` references models"),
+        "{warnings}"
+    );
+}
+
+#[test]
+fn default_export_emits_no_live_secret() {
+    let doc = export(&rows(), false);
+    let pk = &find(&doc, "provider_keys")[0];
+    assert_eq!(
+        pk["api_key"],
         json!("${AISIXSECRET_PROVIDER_KEY_OPENAI_PROD_API_KEY}")
     );
-    // Secret must appear nowhere in the assembled collections.
-    let rendered =
-        serde_json::to_string(&doc.collections.iter().map(|(_, v)| v).collect::<Vec<_>>()).unwrap();
-    assert!(
-        !rendered.contains("sk-super-secret-do-not-leak"),
-        "{rendered}"
-    );
     assert_eq!(doc.secret_placeholders.len(), 1);
-}
+    assert_eq!(doc.secret_placeholders[0].id, PK);
 
-#[test]
-fn reveal_secrets_emits_the_real_value_inline() {
-    let snap = AisixSnapshot::new();
-    snap.provider_keys.insert(ResourceEntry::new(
-        "pk-1",
-        provider_key("openai-prod", "sk-real-value"),
-        1,
-    ));
-    let doc = build_export_document(&snap, true);
-    let pks = find(&doc, "provider_keys");
-    assert_eq!(pks[0]["api_key"], json!("sk-real-value"));
-    assert!(doc.secret_placeholders.is_empty());
-}
-
-fn keyword_guardrail(name: &str) -> aisix_core::models::Guardrail {
-    serde_json::from_value(json!({
-        "name": name, "kind": "keyword",
-        "patterns": [{ "kind": "literal", "value": "blocked-phrase" }]
-    }))
-    .unwrap()
-}
-
-fn attachment(guardrail_id: &str, scope_type: &str, scope_id: Option<&str>) -> Value {
-    let mut a = json!({"guardrail_id": guardrail_id, "scope_type": scope_type, "priority": 1});
-    if let Some(id) = scope_id {
-        a["scope_id"] = json!(id);
-    }
-    a
-}
-
-#[test]
-fn env_scoped_guardrail_exports_with_its_attachment() {
-    // The file carries the scope now, so the guardrail and the attachment
-    // that puts it in force are exported together.
-    let snap = AisixSnapshot::new();
-    snap.guardrails.insert(ResourceEntry::new(
-        "g-1",
-        keyword_guardrail("global-guard"),
-        1,
-    ));
-    snap.guardrail_attachments.insert(ResourceEntry::new(
-        "att-1",
-        serde_json::from_value(attachment("g-1", "env", None)).unwrap(),
-        1,
-    ));
-    let doc = build_export_document(&snap, false);
-    let guardrails = find(&doc, "guardrails");
-    assert_eq!(guardrails.len(), 1);
-    assert_eq!(guardrails[0]["name"], json!("global-guard"));
-
-    let attachments = find(&doc, "guardrail_attachments");
-    assert_eq!(attachments.len(), 1);
-    assert_eq!(attachments[0]["guardrail_id"], json!("global-guard"));
-    assert_eq!(attachments[0]["scope_type"], json!("env"));
-    assert!(attachments[0].get("scope_id").is_none());
-}
-
-#[test]
-fn narrow_scope_survives_the_export_as_a_reference_by_name() {
-    // AISIX-Cloud#1450. This used to assert the opposite: a model-scoped
-    // guardrail was DROPPED, because the file had no attachment collection
-    // and anything it did carry applied gateway-wide — exporting a narrow
-    // rule would have widened it to all traffic. The file expresses scope
-    // now, so the scope round-trips instead of being discarded, and the
-    // reference is emitted as the model's file identity.
-    let snap = AisixSnapshot::new();
-    snap.models.insert(ResourceEntry::new(
-        "m-1",
-        serde_json::from_value(json!({
-            "display_name": "gpt-4o",
-            "provider": "openai",
-            "model_name": "gpt-4o-2024-11-20",
-            "provider_key_id": "pk-1"
-        }))
-        .unwrap(),
-        1,
-    ));
-    snap.guardrails.insert(ResourceEntry::new(
-        "g-scoped",
-        keyword_guardrail("model-guard"),
-        1,
-    ));
-    snap.guardrail_attachments.insert(ResourceEntry::new(
-        "att-1",
-        serde_json::from_value(attachment("g-scoped", "model", Some("m-1"))).unwrap(),
-        1,
-    ));
-
-    let doc = build_export_document(&snap, false);
-    let attachments = find(&doc, "guardrail_attachments");
-    assert_eq!(attachments.len(), 1);
-    assert_eq!(attachments[0]["guardrail_id"], json!("model-guard"));
-    assert_eq!(attachments[0]["scope_type"], json!("model"));
+    let revealed = export(&rows(), true);
     assert_eq!(
-        attachments[0]["scope_id"],
-        json!("gpt-4o"),
-        "scope must be emitted as the model's file identity, not its etcd id",
-    );
-}
-
-#[test]
-fn an_unattached_guardrail_exports_with_no_attachment() {
-    // Inert on both sides now, so exporting it is faithful rather than
-    // dangerous: it governs nothing in etcd and nothing in the file.
-    let snap = AisixSnapshot::new();
-    snap.guardrails.insert(ResourceEntry::new(
-        "g-inert",
-        keyword_guardrail("inert-guard"),
-        1,
-    ));
-    let doc = build_export_document(&snap, false);
-    let guardrails = find(&doc, "guardrails");
-    assert_eq!(guardrails.len(), 1);
-    assert_eq!(guardrails[0]["name"], json!("inert-guard"));
-    assert!(
-        doc.collections
-            .iter()
-            .all(|(k, _)| *k != "guardrail_attachments"),
-        "nothing may be synthesized on the guardrail's behalf",
-    );
-}
-
-#[test]
-fn an_attachment_the_file_cannot_name_is_dropped_with_a_warning() {
-    // Dropping loses scope, which makes the guardrail govern LESS — the
-    // safe direction. Emitting a dangling reference would fail the import
-    // outright (the loader rejects the whole file), and inventing one would
-    // widen it.
-    let snap = AisixSnapshot::new();
-    snap.guardrails.insert(ResourceEntry::new(
-        "g-1",
-        keyword_guardrail("team-guard"),
-        1,
-    ));
-    snap.guardrail_attachments.insert(ResourceEntry::new(
-        "att-missing-model",
-        serde_json::from_value(attachment("g-1", "model", Some("m-gone"))).unwrap(),
-        1,
-    ));
-    snap.guardrail_attachments.insert(ResourceEntry::new(
-        "att-missing-key",
-        serde_json::from_value(attachment("g-1", "api_key", Some("k-gone"))).unwrap(),
-        1,
-    ));
-    snap.guardrail_attachments.insert(ResourceEntry::new(
-        "att-missing-mcp",
-        serde_json::from_value(attachment("g-1", "mcp_server", Some("s-gone"))).unwrap(),
-        1,
-    ));
-    // The export carries no passthrough_routes collection at all, so a
-    // route-scoped attachment has nothing to point at. Emitting the name
-    // anyway produced a file the loader rejected WHOLE, with export still
-    // exiting 0.
-    snap.guardrail_attachments.insert(ResourceEntry::new(
-        "att-route",
-        serde_json::from_value(attachment("g-1", "passthrough_route", Some("r-1"))).unwrap(),
-        1,
-    ));
-
-    let doc = build_export_document(&snap, false);
-    assert!(
-        doc.collections
-            .iter()
-            .all(|(k, _)| *k != "guardrail_attachments"),
-        "no attachment can be named in the file: {:?}",
-        doc.collections
-    );
-    assert!(
-        doc.warnings
-            .iter()
-            .any(|w| w.contains("scoped to a model that is not in the snapshot")),
-        "dangling model scope must be reported: {:?}",
-        doc.warnings
-    );
-    assert!(
-        doc.warnings
-            .iter()
-            .any(|w| w.contains("scoped to an api key that is not in the snapshot")),
-        "dangling api key scope must be reported: {:?}",
-        doc.warnings
-    );
-    assert!(
-        doc.warnings
-            .iter()
-            .any(|w| w.contains("scoped to an MCP server that is not in the snapshot")),
-        "dangling MCP server scope must be reported: {:?}",
-        doc.warnings
-    );
-    assert!(
-        doc.warnings
-            .iter()
-            .any(|w| w.contains("does not carry passthrough routes")),
-        "route scope must be reported: {:?}",
-        doc.warnings
-    );
-}
-
-#[test]
-fn empty_snapshot_yields_only_a_header_later() {
-    let snap = AisixSnapshot::new();
-    let doc = build_export_document(&snap, false);
-    assert!(doc.collections.is_empty());
-    assert!(doc.secret_placeholders.is_empty());
-    assert!(doc.warnings.is_empty());
-}
-
-#[test]
-fn escape_dollars_doubles_dollars_in_string_values_only() {
-    let mut v = json!({
-        "plain": "no dollars",
-        "regex": "price=\\$5 and ${jndi:x}",
-        "nested": { "list": ["a$b", 3, true] }
-    });
-    escape_dollars(&mut v);
-    assert_eq!(v["plain"], json!("no dollars"));
-    assert_eq!(v["regex"], json!("price=\\$$5 and $${jndi:x}"));
-    assert_eq!(v["nested"]["list"][0], json!("a$$b"));
-    // Non-strings untouched.
-    assert_eq!(v["nested"]["list"][1], json!(3));
-    assert_eq!(v["nested"]["list"][2], json!(true));
-}
-
-#[test]
-fn export_output_reloads_through_the_real_file_loader() {
-    use aisix_core::filesource::{derive_id, load_from_str};
-    use std::collections::HashMap;
-
-    let snap = AisixSnapshot::new();
-    snap.provider_keys.insert(ResourceEntry::new(
-        "pk-1",
-        provider_key("openai-prod", "sk-live-value"),
-        1,
-    ));
-    snap.models.insert(ResourceEntry::new(
-        "m-1",
-        model_value(json!({
-            "display_name": "gpt-4o",
-            "provider": "openai",
-            "model_name": "gpt-4o-2024-11-20",
-            "provider_key_id": "pk-1"
-        })),
-        1,
-    ));
-    // A guardrail whose literal contains a real `${...}` — the exact
-    // shape a Log4Shell/template-injection blocklist rule takes. If it
-    // were emitted unescaped the loader would try to interpolate it and
-    // the whole file would fail to load; escaping is what lets it
-    // survive.
-    snap.guardrails.insert(ResourceEntry::new(
-        "g-1",
-        serde_json::from_value(json!({
-            "name": "log4shell",
-            "kind": "keyword",
-            "patterns": [{ "kind": "literal", "value": "${jndi:ldap}" }]
-        }))
-        .unwrap(),
-        1,
-    ));
-    // env-scoped attachment → the guardrail is gateway-wide, so it is
-    // exported (and its `${jndi:ldap}` literal must round-trip).
-    snap.guardrail_attachments.insert(ResourceEntry::new(
-        "att-1",
-        serde_json::from_value(attachment("g-1", "env", None)).unwrap(),
-        1,
-    ));
-    // A routing group whose target is named by RESOURCE ID — the form a
-    // control plane writes and the resources file refuses outright. The
-    // export has to hand back the name spelling or this file does not
-    // load at all: the loader cross-checks every routing target against
-    // the models it defines, and a raw etcd id matches none of them.
-    snap.models.insert(ResourceEntry::new(
-        "m-group",
-        model_value(json!({
-            "display_name": "group",
-            "routing": {"strategy": "failover", "targets": [{"model_id": "m-1"}]}
-        })),
-        1,
-    ));
-    // A claim mapping whose `resolve.api_key_id` must resugar to the
-    // key's (synthetic) file name and re-resolve on load — plus the key
-    // and trust provider it references, so the loader's cross-checks
-    // hold.
-    snap.apikeys.insert(ResourceEntry::new(
-        "ak-1",
-        serde_json::from_value(json!({
-            "key_hash": "91ed2dbc407561556f3e7be98ba0bd2a57986d6a868c482d867d19c6d40d201c",
-            "allowed_models": ["gpt-4o"]
-        }))
-        .unwrap(),
-        1,
-    ));
-    snap.oidc_providers.insert(ResourceEntry::new(
-        "op-1",
-        serde_json::from_value(json!({
-            "name": "corp",
-            "issuer": "https://sso.example.com/realms/agents",
-            "audiences": ["aisix"]
-        }))
-        .unwrap(),
-        1,
-    ));
-    snap.claim_mappings.insert(ResourceEntry::new(
-        "cm-1",
-        serde_json::from_value(json!({
-            "name": "finance-dept",
-            "jwt_provider": "corp",
-            "match": [{"claim": "department", "op": "exact", "values": ["finance"]}],
-            "resolve": {"api_key_id": "ak-1"}
-        }))
-        .unwrap(),
-        1,
-    ));
-
-    let doc = build_export_document(&snap, false);
-    let yaml = crate::export::yaml_emit::emit_yaml(&doc).expect("emit");
-
-    // Feed the placeholders the file loader will interpolate.
-    let env: HashMap<String, String> = doc
-        .secret_placeholders
-        .iter()
-        .map(|p| (p.env_var.clone(), "sk-real".to_string()))
-        .collect();
-    let loaded = load_from_str(&yaml, "exported.yaml", 1, &|n| env.get(n).cloned())
-        .expect("the exported file must re-load through the file source");
-
-    // Same resource set, and the reference resugared then re-resolved to
-    // the same derived id the loader assigns.
-    assert_eq!(loaded.provider_keys.len(), 1);
-    assert_eq!(loaded.models.len(), 2);
-    assert_eq!(loaded.guardrails.len(), 1);
-    let model = loaded.models.get_by_name("gpt-4o").unwrap();
-    assert_eq!(
-        model.value.provider_key_id.as_deref(),
-        Some(derive_id("provider_keys", "openai-prod").as_str())
-    );
-    // The id-named routing target came back as the name the file keys
-    // its models by. Reaching this line at all is most of the assertion:
-    // the load above would have failed had the id been emitted raw.
-    let group = loaded.models.get_by_name("group").unwrap();
-    assert_eq!(
-        group.value.routing.as_ref().unwrap().targets[0].model,
-        "gpt-4o"
-    );
-    assert!(group.value.routing.as_ref().unwrap().targets[0]
-        .model_id
-        .is_none());
-
-    // The `${jndi:ldap}` literal came back byte-for-byte — not
-    // interpolated, not corrupted.
-    let guardrail = loaded.guardrails.get_by_name("log4shell").unwrap();
-    let value = serde_json::to_value(&guardrail.value).unwrap();
-    assert_eq!(value["patterns"][0]["value"], json!("${jndi:ldap}"));
-
-    // The claim mapping's key reference resugared to the synthetic file
-    // name and re-resolved to the id the loader derives for that key —
-    // the whole reason the exporter cannot emit the raw etcd uuid.
-    assert_eq!(loaded.oidc_providers.len(), 1);
-    assert_eq!(loaded.claim_mappings.len(), 1);
-    let cm = loaded.claim_mappings.get_by_name("finance-dept").unwrap();
-    assert_eq!(cm.value.jwt_provider, "corp");
-    assert_eq!(
-        cm.value.resolve.api_key_id,
-        derive_id("api_keys", "apikey-91ed2dbc40756155")
-    );
-}
-
-#[test]
-fn dangling_claim_mapping_target_is_kept_and_blocking() {
-    let snap = AisixSnapshot::new();
-    snap.claim_mappings.insert(ResourceEntry::new(
-        "cm-1",
-        serde_json::from_value(json!({
-            "name": "finance-dept",
-            "jwt_provider": "corp",
-            "match": [{"claim": "department", "op": "exact", "values": ["finance"]}],
-            "resolve": {"api_key_id": "ak-does-not-exist"}
-        }))
-        .unwrap(),
-        1,
-    ));
-    let doc = build_export_document(&snap, false);
-    let mappings = find(&doc, "claim_mappings");
-    assert_eq!(mappings.len(), 1);
-    // Raw id kept, no name sugar minted for a key that isn't there.
-    assert_eq!(
-        mappings[0]["resolve"]["api_key_id"],
-        json!("ak-does-not-exist")
-    );
-    assert!(mappings[0]["resolve"].get("api_key").is_none());
-    // A dangling target makes the file non-loadable → blocking.
-    assert!(
-        doc.blocking
-            .iter()
-            .any(|w| w.contains("dangling") && w.contains("finance-dept")),
-        "{:?}",
-        doc.blocking
-    );
-}
-
-/// A team scope has no collection to name, but it still round-trips: the id
-/// goes through verbatim, `api_keys[].team_id` is a file field, and the
-/// runtime compares the two as bare strings. Dropping it would narrow a
-/// guardrail while the team-scoped rate limit beside it survived.
-#[test]
-fn a_team_scope_is_carried_through_verbatim() {
-    let snap = AisixSnapshot::new();
-    snap.guardrails.insert(ResourceEntry::new(
-        "g-1",
-        keyword_guardrail("team-guard"),
-        1,
-    ));
-    snap.guardrail_attachments.insert(ResourceEntry::new(
-        "att-team",
-        serde_json::from_value(attachment("g-1", "team", Some("team-alpha"))).unwrap(),
-        1,
-    ));
-
-    let doc = build_export_document(&snap, false);
-    let attachments = find(&doc, "guardrail_attachments");
-    assert_eq!(attachments.len(), 1);
-    assert_eq!(attachments[0]["scope_type"], json!("team"));
-    assert_eq!(
-        attachments[0]["scope_id"],
-        json!("team-alpha"),
-        "a team id has no name to resolve to and must survive unchanged",
-    );
-    assert!(
-        doc.warnings.is_empty(),
-        "a team scope is expressible, so nothing should be reported: {:?}",
-        doc.warnings
-    );
-}
-
-#[test]
-fn model_pricing_key_is_dropped_from_the_export() {
-    let snap = AisixSnapshot::new();
-    snap.provider_keys
-        .insert(ResourceEntry::new("pk", provider_key("pk", "sk"), 1));
-    snap.models.insert(ResourceEntry::new(
-        "m-1",
-        model_value(json!({
-            "display_name": "priced-by-catalog",
-            "provider": "openai",
-            "model_name": "x",
-            "provider_key_id": "pk",
-            "pricing_key": "openai/x"
-        })),
-        1,
-    ));
-    snap.models.insert(ResourceEntry::new(
-        "m-2",
-        model_value(json!({
-            "display_name": "priced-inline-too",
-            "provider": "openai",
-            "model_name": "x",
-            "provider_key_id": "pk",
-            "pricing_key": "openai/x",
-            "cost": {"input_per_1k": 1.0, "output_per_1k": 2.0}
-        })),
-        1,
-    ));
-
-    let doc = build_export_document(&snap, false);
-    let models = find(&doc, "models");
-    // The reference has no file form, so neither model keeps it — the
-    // file source rejects the field outright.
-    for m in models {
-        assert!(m.get("pricing_key").is_none(), "{m:?}");
-    }
-    // BOTH are reported. The first loses its price outright. The second
-    // keeps a number, but a DIFFERENT one — the document outranks the
-    // inline `cost` at runtime, so exporting silently reprices it.
-    assert_eq!(doc.warnings.len(), 2, "{:?}", doc.warnings);
-    let by_catalog = doc
-        .warnings
-        .iter()
-        .find(|w| w.contains("priced-by-catalog"))
-        .expect("the model with no inline cost is reported");
-    assert!(by_catalog.contains("least_cost"), "{by_catalog:?}");
-    let inline_too = doc
-        .warnings
-        .iter()
-        .find(|w| w.contains("priced-inline-too"))
-        .expect("the model that falls back to a different price is reported");
-    assert!(inline_too.contains("`cost`"), "{inline_too:?}");
-    assert!(doc.blocking.is_empty(), "{:?}", doc.blocking);
-}
-
-#[test]
-fn api_key_allowed_model_ids_resugar_to_names() {
-    let snap = AisixSnapshot::new();
-    snap.provider_keys
-        .insert(ResourceEntry::new("pk", provider_key("pk", "sk"), 1));
-    for (id, display_name) in [("m-uuid-1", "gpt-4o"), ("m-uuid-2", "claude")] {
-        snap.models.insert(ResourceEntry::new(
-            id,
-            model_value(json!({
-                "display_name": display_name,
-                "provider": "openai",
-                "model_name": "x",
-                "provider_key_id": "pk"
-            })),
-            1,
-        ));
-    }
-    snap.apikeys.insert(ResourceEntry::new(
-        "k-uuid-1",
-        serde_json::from_value(json!({
-            "key_hash": "aa".repeat(32),
-            "allowed_models": ["stale-name"],
-            "allowed_model_ids": ["m-uuid-2"]
-        }))
-        .unwrap(),
-        1,
-    ));
-
-    let doc = build_export_document(&snap, false);
-    let keys = find(&doc, "api_keys");
-    // The file source grants by name only: the id form never reaches it,
-    // and the name it resolves to replaces whatever `allowed_models` held.
-    assert!(keys[0].get("allowed_model_ids").is_none());
-    assert_eq!(keys[0]["allowed_models"], json!(["claude"]));
-    assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
-    assert!(doc.blocking.is_empty(), "{:?}", doc.blocking);
-}
-
-#[test]
-fn api_key_unresolvable_model_id_is_dropped_and_warned() {
-    let snap = AisixSnapshot::new();
-    snap.provider_keys
-        .insert(ResourceEntry::new("pk", provider_key("pk", "sk"), 1));
-    snap.models.insert(ResourceEntry::new(
-        "m-uuid-1",
-        model_value(
-            json!({"display_name": "gpt-4o", "provider": "openai", "model_name": "x", "provider_key_id": "pk"}),
-        ),
-        1,
-    ));
-    snap.apikeys.insert(ResourceEntry::new(
-        "k-uuid-1",
-        serde_json::from_value(json!({
-            "key_hash": "aa".repeat(32),
-            "allowed_model_ids": ["m-uuid-1", "m-gone"]
-        }))
-        .unwrap(),
-        1,
-    ));
-
-    let doc = build_export_document(&snap, false);
-    let keys = find(&doc, "api_keys");
-    // Emitting "m-gone" as a name would fail the loader's model
-    // cross-reference and take the whole file down; dropping it only
-    // narrows the key, which is what the gateway already does.
-    assert_eq!(keys[0]["allowed_models"], json!(["gpt-4o"]));
-    assert!(
-        doc.warnings.iter().any(|w| w.contains("m-gone")),
-        "{:?}",
-        doc.warnings
-    );
-    assert!(doc.blocking.is_empty(), "{:?}", doc.blocking);
-}
-
-#[test]
-fn api_key_empty_allowed_model_ids_export_as_no_grant() {
-    let snap = AisixSnapshot::new();
-    snap.apikeys.insert(ResourceEntry::new(
-        "k-uuid-1",
-        serde_json::from_value(json!({
-            "key_hash": "aa".repeat(32),
-            "allowed_models": ["*"],
-            "allowed_model_ids": []
-        }))
-        .unwrap(),
-        1,
-    ));
-    let doc = build_export_document(&snap, false);
-    let keys = find(&doc, "api_keys");
-    // An empty id list is authoritative at runtime, so the exported file
-    // must not resurrect the ignored `allowed_models: ["*"]`.
-    assert_eq!(keys[0]["allowed_models"], json!([]));
-}
-
-/// Every id-form model reference in a model document leaves the export as
-/// the name form the resources file accepts — the file refuses the id
-/// form outright, so an export that kept it would not reload.
-#[test]
-fn model_reference_ids_resugar_to_names() {
-    let snap = AisixSnapshot::new();
-    snap.provider_keys
-        .insert(ResourceEntry::new("pk-1", provider_key("pk", "sk-x"), 1));
-    for (id, name) in [("m-a", "alpha"), ("m-b", "beta"), ("m-c", "gamma")] {
-        snap.models.insert(ResourceEntry::new(
-            id,
-            model_value(json!({
-                "display_name": name,
-                "provider": "openai",
-                "model_name": "gpt-4o",
-                "provider_key_id": "pk-1"
-            })),
-            1,
-        ));
-    }
-    snap.models.insert(ResourceEntry::new(
-        "m-embed",
-        model_value(json!({
-            "display_name": "embedder",
-            "provider": "openai",
-            "model_name": "text-embedding-3-small",
-            "provider_key_id": "pk-1",
-            "embedding": {"dimensions": 4}
-        })),
-        1,
-    ));
-    snap.models.insert(ResourceEntry::new(
-        "m-group",
-        model_value(json!({
-            "display_name": "group",
-            "routing": {"targets": [{"model_id": "m-a"}, {"model": "beta"}]}
-        })),
-        1,
-    ));
-    snap.models.insert(ResourceEntry::new(
-        "m-panel",
-        model_value(json!({
-            "display_name": "panel",
-            "ensemble": {
-                "panel": [{"model_id": "m-a"}, {"model_id": "m-b"}],
-                "judge": {"model_id": "m-c"}
-            }
-        })),
-        1,
-    ));
-    snap.models.insert(ResourceEntry::new(
-        "m-router",
-        model_value(json!({
-            "display_name": "router",
-            "semantic": {
-                "embedding_model_id": "m-embed",
-                "routes": [{"name": "r", "target_id": "m-a", "examples": ["hi"]}],
-                "default_id": "m-b",
-                "match": {"threshold": 0.5},
-                "on_embedding_failure": {"target_id": "m-c"}
-            }
-        })),
-        1,
-    ));
-
-    let doc = build_export_document(&snap, false);
-    let by_name = |name: &str| -> Value {
-        find(&doc, "models")
-            .iter()
-            .find(|m| m["display_name"] == json!(name))
-            .cloned()
-            .unwrap_or_else(|| panic!("{name} exported"))
-    };
-
-    let group = by_name("group");
-    assert_eq!(group["routing"]["targets"][0]["model"], json!("alpha"));
-    assert!(group["routing"]["targets"][0].get("model_id").is_none());
-    assert_eq!(group["routing"]["targets"][1]["model"], json!("beta"));
-
-    let panel = by_name("panel");
-    assert_eq!(panel["ensemble"]["panel"][0]["model"], json!("alpha"));
-    assert_eq!(panel["ensemble"]["panel"][1]["model"], json!("beta"));
-    assert_eq!(panel["ensemble"]["judge"]["model"], json!("gamma"));
-    assert!(panel["ensemble"]["judge"].get("model_id").is_none());
-
-    let router = by_name("router");
-    assert_eq!(router["semantic"]["embedding_model"], json!("embedder"));
-    assert_eq!(router["semantic"]["routes"][0]["target"], json!("alpha"));
-    assert_eq!(router["semantic"]["default"], json!("beta"));
-    assert_eq!(
-        router["semantic"]["on_embedding_failure"]["target"],
-        json!("gamma")
-    );
-    assert!(router["semantic"].get("embedding_model_id").is_none());
-    assert!(router["semantic"].get("default_id").is_none());
-
-    assert!(doc.blocking.is_empty(), "{:?}", doc.blocking);
-}
-
-/// An id no exported model answers to is emitted under the name field as
-/// itself — the same dangling reference the gateway already sees. For a
-/// model the loader cross-checks it, so it is blocking.
-#[test]
-fn dangling_model_reference_id_is_emitted_as_a_name_and_blocking() {
-    let snap = AisixSnapshot::new();
-    snap.models.insert(ResourceEntry::new(
-        "m-group",
-        model_value(json!({
-            "display_name": "group",
-            "routing": {"targets": [{"model_id": "m-gone"}]}
-        })),
-        1,
-    ));
-    let doc = build_export_document(&snap, false);
-    let group = &find(&doc, "models")[0];
-    assert_eq!(group["routing"]["targets"][0]["model"], json!("m-gone"));
-    assert!(group["routing"]["targets"][0].get("model_id").is_none());
-    assert!(
-        doc.blocking
-            .iter()
-            .any(|b| b.contains("dangling") && b.contains("m-gone")),
-        "{:?}",
-        doc.blocking
-    );
-}
-
-/// A cache policy's model scope collapses into the `applies_to` string the
-/// file understands, overriding whatever that string held — the same
-/// precedence the gateway applies.
-#[test]
-fn cache_policy_model_scope_id_resugars_into_applies_to() {
-    let snap = AisixSnapshot::new();
-    snap.provider_keys
-        .insert(ResourceEntry::new("pk-1", provider_key("pk", "sk-x"), 1));
-    snap.models.insert(ResourceEntry::new(
-        "m-embed",
-        model_value(json!({
-            "display_name": "embedder",
-            "provider": "openai",
-            "model_name": "text-embedding-3-small",
-            "provider_key_id": "pk-1",
-            "embedding": {"dimensions": 4}
-        })),
-        1,
-    ));
-    let policy: aisix_core::models::CachePolicy = serde_json::from_value(json!({
-        "name": "faq",
-        "applies_to": "all",
-        "applies_to_model_id": "m-embed",
-        "semantic": {"embedding_model_id": "m-embed", "threshold": 0.9}
-    }))
-    .unwrap();
-    snap.cache_policies
-        .insert(ResourceEntry::new("cp-1", policy, 1));
-
-    let doc = build_export_document(&snap, false);
-    let exported = &find(&doc, "cache_policies")[0];
-    assert_eq!(exported["applies_to"], json!("model:embedder"));
-    assert!(exported.get("applies_to_model_id").is_none());
-    assert_eq!(exported["semantic"]["embedding_model"], json!("embedder"));
-    assert!(exported["semantic"].get("embedding_model_id").is_none());
-}
-
-/// A semantic guardrail's embedder id becomes the name form. The loader
-/// does not cross-check it, so a dangling one is a warning and the file
-/// still loads (screening then refuses, fail-closed, as it already did).
-#[test]
-fn guardrail_embedder_id_resugars_to_a_name() {
-    let snap = AisixSnapshot::new();
-    snap.provider_keys
-        .insert(ResourceEntry::new("pk-1", provider_key("pk", "sk-x"), 1));
-    snap.models.insert(ResourceEntry::new(
-        "m-embed",
-        model_value(json!({
-            "display_name": "embedder",
-            "provider": "openai",
-            "model_name": "text-embedding-3-small",
-            "provider_key_id": "pk-1",
-            "embedding": {"dimensions": 4}
-        })),
-        1,
-    ));
-    let row = |name: &str, id: &str| -> aisix_core::models::Guardrail {
-        serde_json::from_value(json!({
-            "name": name,
-            "kind": "semantic",
-            "embedding_model_id": id,
-            "deny_examples": ["x"],
-            "deny_threshold": 0.8
-        }))
-        .unwrap()
-    };
-    snap.guardrails
-        .insert(ResourceEntry::new("g-1", row("resolved", "m-embed"), 1));
-    snap.guardrails
-        .insert(ResourceEntry::new("g-2", row("dangling", "m-gone"), 1));
-
-    let doc = build_export_document(&snap, false);
-    let by_name = |name: &str| -> Value {
-        find(&doc, "guardrails")
-            .iter()
-            .find(|g| g["name"] == json!(name))
-            .cloned()
-            .unwrap_or_else(|| panic!("{name} exported"))
-    };
-    assert_eq!(by_name("resolved")["embedding_model"], json!("embedder"));
-    assert!(by_name("resolved").get("embedding_model_id").is_none());
-    assert_eq!(by_name("dangling")["embedding_model"], json!("m-gone"));
-    assert!(doc.blocking.is_empty(), "{:?}", doc.blocking);
-    assert!(
-        doc.warnings.iter().any(|w| w.contains("m-gone")),
-        "{:?}",
-        doc.warnings
-    );
-}
-
-/// Register `(id, name)` MCP servers on `snap`.
-fn register_mcp_servers(snap: &AisixSnapshot, servers: &[(&str, &str)]) {
-    for (id, name) in servers {
-        snap.mcp_servers.insert(ResourceEntry::new(
-            *id,
-            serde_json::from_value(json!({"name": name, "url": "https://example.test/mcp"}))
-                .unwrap(),
-            1,
-        ));
-    }
-}
-
-#[test]
-fn api_key_mcp_reference_ids_resugar_to_names() {
-    let snap = AisixSnapshot::new();
-    register_mcp_servers(&snap, &[("s-uuid-1", "github"), ("s-uuid-2", "slack")]);
-    snap.apikeys.insert(ResourceEntry::new(
-        "k-uuid-1",
-        serde_json::from_value(json!({
-            "key_hash": "aa".repeat(32),
-            "allowed_models": [],
-            "mcp_rate_limits": {"stale-name": {"rpm": 9}},
-            "mcp_rate_limits_by_id": {"s-uuid-2": {"rpm": 1}},
-            "mcp_access": {
-                "allow": ["stale-name__*"],
-                "allow_ids": [{"server_id": "s-uuid-1", "tool": "create_issue"}],
-                "deny": ["stale-name__drop"],
-                "deny_ids": [{"server_id": "s-uuid-1", "tool": "delete_*"}]
-            }
-        }))
-        .unwrap(),
-        1,
-    ));
-
-    let doc = build_export_document(&snap, false);
-    let keys = find(&doc, "api_keys");
-    // The file source names its MCP servers: the id form never reaches it,
-    // and each name it resolves to replaces the shadowed name field
-    // wholesale — keeping the stale one would export a different ACL than
-    // the gateway is enforcing.
-    assert!(keys[0].get("mcp_rate_limits_by_id").is_none());
-    assert_eq!(keys[0]["mcp_rate_limits"], json!({"slack": {"rpm": 1}}));
-    assert!(keys[0]["mcp_access"].get("allow_ids").is_none());
-    assert!(keys[0]["mcp_access"].get("deny_ids").is_none());
-    assert_eq!(
-        keys[0]["mcp_access"]["allow"],
-        json!(["github__create_issue"])
-    );
-    assert_eq!(keys[0]["mcp_access"]["deny"], json!(["github__delete_*"]));
-    assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
-    assert!(doc.blocking.is_empty(), "{:?}", doc.blocking);
-}
-
-#[test]
-fn api_key_unresolvable_mcp_server_ids_are_dropped_and_warned() {
-    let snap = AisixSnapshot::new();
-    register_mcp_servers(&snap, &[("s-uuid-1", "github")]);
-    snap.apikeys.insert(ResourceEntry::new(
-        "k-uuid-1",
-        serde_json::from_value(json!({
-            "key_hash": "aa".repeat(32),
-            "allowed_models": [],
-            "mcp_rate_limits_by_id": {"s-uuid-1": {"rpm": 1}, "s-gone": {"rpm": 2}},
-            "mcp_access": {
-                "allow": [],
-                "allow_ids": [
-                    {"server_id": "s-uuid-1", "tool": "*"},
-                    {"server_id": "s-gone", "tool": "*"}
-                ]
-            }
-        }))
-        .unwrap(),
-        1,
-    ));
-
-    let doc = build_export_document(&snap, false);
-    let keys = find(&doc, "api_keys");
-    assert_eq!(keys[0]["mcp_rate_limits"], json!({"github": {"rpm": 1}}));
-    assert_eq!(keys[0]["mcp_access"]["allow"], json!(["github__*"]));
-    assert_eq!(
-        doc.warnings.iter().filter(|w| w.contains("s-gone")).count(),
-        2,
-        "one warning for the dropped limit and one for the dropped grant: {:?}",
-        doc.warnings
-    );
-    assert!(doc.blocking.is_empty(), "{:?}", doc.blocking);
-}
-
-#[test]
-fn api_key_empty_mcp_id_forms_export_as_no_grant_and_no_limit() {
-    let snap = AisixSnapshot::new();
-    register_mcp_servers(&snap, &[("s-uuid-1", "github")]);
-    snap.apikeys.insert(ResourceEntry::new(
-        "k-uuid-1",
-        serde_json::from_value(json!({
-            "key_hash": "aa".repeat(32),
-            "allowed_models": [],
-            "mcp_rate_limits": {"github": {"rpm": 9}},
-            "mcp_rate_limits_by_id": {},
-            "mcp_access": {"allow": ["*"], "allow_ids": []}
-        }))
-        .unwrap(),
-        1,
-    ));
-
-    let doc = build_export_document(&snap, false);
-    let keys = find(&doc, "api_keys");
-    // Both empty id forms are authoritative at runtime, so the exported
-    // file must not resurrect the ignored name forms.
-    assert_eq!(keys[0]["mcp_rate_limits"], json!({}));
-    assert_eq!(keys[0]["mcp_access"]["allow"], json!([]));
-}
-
-#[test]
-fn a_server_name_containing_a_star_gets_no_name_form_grant() {
-    // A registered name may legally contain a `*`. The runtime compares
-    // the server id exactly, so an id grant on `gh*` reaches `gh*` alone —
-    // but `gh*__read` as a name-form pattern also matches `ghost__read`.
-    // The export must not manufacture that grant.
-    let snap = AisixSnapshot::new();
-    register_mcp_servers(&snap, &[("s-star", "gh*"), ("s-other", "ghost")]);
-    snap.apikeys.insert(ResourceEntry::new(
-        "k-uuid-1",
-        serde_json::from_value(json!({
-            "key_hash": "aa".repeat(32),
-            "allowed_models": [],
-            "mcp_access": {
-                "allow": [],
-                "allow_ids": [
-                    {"server_id": "s-star", "tool": "read"},
-                    {"server_id": "s-other", "tool": "read"}
-                ]
-            }
-        }))
-        .unwrap(),
-        1,
-    ));
-
-    let doc = build_export_document(&snap, false);
-    let keys = find(&doc, "api_keys");
-    assert_eq!(keys[0]["mcp_access"]["allow"], json!(["ghost__read"]));
-    assert!(
-        doc.warnings.iter().any(|w| w.contains("gh*")),
-        "{:?}",
-        doc.warnings
-    );
-    // The `gh*` ROW is blocking in its own right (the write pattern no
-    // longer accepts such a name), but nothing about the grant is: this
-    // case is a drop, not a refusal.
-    assert!(
-        !doc.blocking.iter().any(|b| b.contains("mcp_access")),
-        "{:?}",
-        doc.blocking
-    );
-}
-
-#[test]
-fn a_star_named_server_on_the_deny_side_blocks_the_export() {
-    // Dropping the entry would leave the exported file permitting a tool
-    // the gateway blocks, and emitting `gh*__delete` would deny one it
-    // allows. Neither is a file that reproduces the gateway, so the export
-    // says so instead of picking.
-    let snap = AisixSnapshot::new();
-    register_mcp_servers(&snap, &[("s-star", "gh*")]);
-    snap.apikeys.insert(ResourceEntry::new(
-        "k-uuid-1",
-        serde_json::from_value(json!({
-            "key_hash": "aa".repeat(32),
-            "allowed_models": [],
-            "mcp_access": {
-                "allow": ["*"],
-                "deny_ids": [{"server_id": "s-star", "tool": "delete"}]
-            }
-        }))
-        .unwrap(),
-        1,
-    ));
-
-    let doc = build_export_document(&snap, false);
-    assert!(
-        doc.blocking.iter().any(|b| b.contains("gh*")),
-        "{:?}",
-        doc.blocking
-    );
-    let keys = find(&doc, "api_keys");
-    assert_eq!(keys[0]["mcp_access"]["deny"], json!([]));
-}
-
-/// The anonymous ceiling with `server_ids` set: one anonymous block,
-/// registered servers as named.
-fn anonymous_settings(anonymous: Value) -> ResourceEntry<aisix_core::models::McpAuthSettings> {
-    ResourceEntry::new(
-        "env-uuid-1",
-        serde_json::from_value(json!({ "anonymous": anonymous })).unwrap(),
-        1,
-    )
-}
-
-#[test]
-fn anonymous_ceiling_server_ids_resugar_to_names() {
-    let snap = AisixSnapshot::new();
-    register_mcp_servers(&snap, &[("s-uuid-1", "docs"), ("s-uuid-2", "kb")]);
-    snap.mcp_auth_settings.insert(anonymous_settings(json!({
-        "api_key_id": "k-uuid-1",
-        "source_cidrs": ["10.0.0.0/8"],
-        // Deliberately stale: the id form is authoritative at runtime, so
-        // the exported file must carry what the gateway enforces, not what
-        // the shadowed name field still says.
-        "servers": ["stale-name"],
-        "server_ids": ["s-uuid-2"]
-    })));
-
-    let doc = build_export_document(&snap, false);
-    let settings = find(&doc, "mcp_auth_settings");
-    assert!(settings[0]["anonymous"].get("server_ids").is_none());
-    assert_eq!(settings[0]["anonymous"]["servers"], json!(["kb"]));
-    assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
-    assert!(doc.blocking.is_empty(), "{:?}", doc.blocking);
-}
-
-#[test]
-fn an_unresolvable_id_in_the_anonymous_ceiling_is_dropped_and_warned() {
-    let snap = AisixSnapshot::new();
-    register_mcp_servers(&snap, &[("s-uuid-1", "docs")]);
-    snap.mcp_auth_settings.insert(anonymous_settings(json!({
-        "api_key_id": "k-uuid-1",
-        "source_cidrs": ["10.0.0.0/8"],
-        "servers": ["docs"],
-        "server_ids": ["s-gone", "s-uuid-1"]
-    })));
-
-    let doc = build_export_document(&snap, false);
-    let settings = find(&doc, "mcp_auth_settings");
-    assert_eq!(settings[0]["anonymous"]["servers"], json!(["docs"]));
-    assert_eq!(
-        doc.warnings.iter().filter(|w| w.contains("s-gone")).count(),
-        1,
-        "{:?}",
-        doc.warnings
-    );
-    assert!(doc.blocking.is_empty(), "{:?}", doc.blocking);
-}
-
-#[test]
-fn an_anonymous_ceiling_admitting_no_server_blocks_the_export() {
-    // `anonymous.servers` must name at least one server, so the file has
-    // no spelling for a ceiling that admits none — and emitting the stale
-    // name field instead would export anonymous access to a server the
-    // gateway is refusing. The export says so rather than picking.
-    let snap = AisixSnapshot::new();
-    register_mcp_servers(&snap, &[("s-uuid-1", "docs")]);
-    snap.mcp_auth_settings.insert(anonymous_settings(json!({
-        "api_key_id": "k-uuid-1",
-        "source_cidrs": ["10.0.0.0/8"],
-        "servers": ["docs"],
-        "server_ids": []
-    })));
-
-    let doc = build_export_document(&snap, false);
-    assert!(
-        doc.blocking.iter().any(|b| b.contains("admits no server")),
-        "{:?}",
-        doc.blocking
-    );
-    let settings = find(&doc, "mcp_auth_settings");
-    assert_eq!(settings[0]["anonymous"]["servers"], json!([]));
-}
-
-#[test]
-fn a_star_named_server_in_the_anonymous_ceiling_blocks_the_export() {
-    // The ceiling is applied as `<server>__*`, so a name built from `gh*`
-    // yields a two-`*` pattern, which `wildcard_matches` refuses outright
-    // — the file would state a ceiling admitting NONE of that server's
-    // tools where the stored one admits all of them. (The allow/deny
-    // sides fail the opposite way for the same character.)
-    let snap = AisixSnapshot::new();
-    register_mcp_servers(&snap, &[("s-star", "gh*"), ("s-ghost", "ghost")]);
-    snap.mcp_auth_settings.insert(anonymous_settings(json!({
-        "api_key_id": "k-uuid-1",
-        "source_cidrs": ["10.0.0.0/8"],
-        "servers": ["gh*"],
-        "server_ids": ["s-star"]
-    })));
-
-    let doc = build_export_document(&snap, false);
-    assert!(
-        doc.blocking.iter().any(|b| b.contains("gh*")),
-        "{:?}",
-        doc.blocking
-    );
-}
-
-#[test]
-fn an_anonymous_ceiling_without_server_ids_is_left_alone() {
-    let snap = AisixSnapshot::new();
-    register_mcp_servers(&snap, &[("s-uuid-1", "docs")]);
-    snap.mcp_auth_settings.insert(anonymous_settings(json!({
-        "api_key_id": "k-uuid-1",
-        "source_cidrs": ["10.0.0.0/8"],
-        "servers": ["docs"]
-    })));
-
-    let doc = build_export_document(&snap, false);
-    let settings = find(&doc, "mcp_auth_settings");
-    assert_eq!(settings[0]["anonymous"]["servers"], json!(["docs"]));
-    assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
-    assert!(doc.blocking.is_empty(), "{:?}", doc.blocking);
-}
-
-#[test]
-fn a_star_named_mcp_server_row_blocks_the_export() {
-    // The row loads from etcd unchanged — the read pattern deliberately
-    // still accepts it — but the WRITE pattern does not, so the file this
-    // export produces would fail `aisix validate`. The blocking list is
-    // the answer to "will this file load as-is", so it has to say so.
-    let snap = AisixSnapshot::new();
-    register_mcp_servers(&snap, &[("s-star", "gh*"), ("s-ok", "docs")]);
-
-    let doc = build_export_document(&snap, false);
-    assert!(
-        doc.blocking.iter().any(|b| b.contains("gh*")),
-        "{:?}",
-        doc.blocking
-    );
-    // The row is still emitted verbatim: renaming it here would silently
-    // detach every grant, limit and ceiling that names it.
-    let servers = find(&doc, "mcp_servers");
-    assert!(servers.iter().any(|s| s["name"] == json!("gh*")));
-    assert!(servers.iter().any(|s| s["name"] == json!("docs")));
-}
-
-#[test]
-fn a_ceiling_of_only_star_named_servers_blocks_once_with_the_right_advice() {
-    // Every entry dropped for a `*` name leaves the resolved list empty,
-    // but "admits no server — disable anonymous access instead" is the
-    // wrong fix here; the star diagnostic already names the real one.
-    let snap = AisixSnapshot::new();
-    register_mcp_servers(&snap, &[("s-star", "gh*")]);
-    snap.mcp_auth_settings.insert(anonymous_settings(json!({
-        "api_key_id": "k-uuid-1",
-        "source_cidrs": ["10.0.0.0/8"],
-        "servers": ["gh*"],
-        "server_ids": ["s-star"]
-    })));
-
-    let doc = build_export_document(&snap, false);
-    assert!(
-        !doc.blocking.iter().any(|b| b.contains("admits no server")),
-        "{:?}",
-        doc.blocking
-    );
-    assert_eq!(
-        doc.blocking
-            .iter()
-            .filter(|b| b.contains("anonymous MCP ceiling"))
-            .count(),
-        1,
-        "{:?}",
-        doc.blocking
-    );
-}
-
-#[test]
-fn default_export_emits_no_live_oidc_login_client_secret() {
-    let snap = AisixSnapshot::new();
-    snap.oidc_providers.insert(ResourceEntry::new(
-        "op-1",
-        serde_json::from_value(json!({
-            "name": "corp",
-            "issuer": "https://idp.example",
-            "audiences": ["a"],
-            "login": {"client_id": "gw", "client_secret": "login-secret-do-not-leak"},
-        }))
-        .unwrap(),
-        1,
-    ));
-    let doc = build_export_document(&snap, false);
-    let login = &find(&doc, "oidc_providers")[0]["login"];
-    assert_eq!(login["client_id"], json!("gw"));
-    assert_eq!(
-        login["client_secret"],
-        json!("${AISIXSECRET_OIDC_PROVIDER_CORP_CLIENT_SECRET}")
-    );
-    let revealed = build_export_document(&snap, true);
-    assert_eq!(
-        find(&revealed, "oidc_providers")[0]["login"]["client_secret"],
-        json!("login-secret-do-not-leak")
-    );
-}
-
-#[test]
-fn default_export_emits_no_live_oidc_shared_secret() {
-    let snap = AisixSnapshot::new();
-    snap.oidc_providers.insert(ResourceEntry::new(
-        "op-1",
-        serde_json::from_value(json!({
-            "name": "shared-idp",
-            "hmac_secret": "hmac-super-secret-do-not-leak-32b",
-        }))
-        .unwrap(),
-        1,
-    ));
-    let doc = build_export_document(&snap, false);
-    let providers = find(&doc, "oidc_providers");
-    assert_eq!(
-        providers[0]["hmac_secret"],
-        json!("${AISIXSECRET_OIDC_PROVIDER_SHARED_IDP_HMAC_SECRET}")
-    );
-    let rendered =
-        serde_json::to_string(&doc.collections.iter().map(|(_, v)| v).collect::<Vec<_>>()).unwrap();
-    assert!(
-        !rendered.contains("hmac-super-secret-do-not-leak-32b"),
-        "{rendered}"
-    );
-    assert_eq!(doc.secret_placeholders.len(), 1);
-    assert_eq!(doc.secret_placeholders[0].kind, "oidc_providers");
-
-    // `--reveal-secrets` is the only way the real value is written out.
-    let revealed = build_export_document(&snap, true);
-    assert_eq!(
-        find(&revealed, "oidc_providers")[0]["hmac_secret"],
-        json!("hmac-super-secret-do-not-leak-32b")
+        find(&revealed, "provider_keys")[0]["api_key"],
+        json!("sk-live")
     );
     assert!(revealed.secret_placeholders.is_empty());
 }
 
 #[test]
-fn team_and_user_documents_are_reported_not_dropped_silently() {
-    let snap = AisixSnapshot::new();
-    let team: aisix_core::Team = serde_json::from_value(json!({"name": "Platform"})).unwrap();
-    snap.teams.insert(ResourceEntry::new("t-1", team, 1));
-    let user: aisix_core::User = serde_json::from_value(json!({"name": "Alice"})).unwrap();
-    snap.users
-        .insert(ResourceEntry::new("u-1", user.clone(), 1));
-    snap.users.insert(ResourceEntry::new("u-2", user, 1));
+fn credentials_beside_the_api_key_are_redacted() {
+    let doc = export(
+        &[
+            (
+                "provider_keys",
+                PK,
+                json!({
+                    "display_name": "mistral",
+                    "api_key": "sk-1",
+                    "request": {
+                        "default_headers": {"x-secondary": "tok-2"},
+                        "default_body_fields": {"token": "tok-3", "safe_prompt": true}
+                    }
+                }),
+            ),
+            (
+                "oidc_providers",
+                MODEL,
+                json!({"name": "corp", "hmac_secret": "s".repeat(40)}),
+            ),
+        ],
+        false,
+    );
+    let text = serde_json::to_string(&doc.collections).unwrap();
+    for secret in ["sk-1", "tok-2", "tok-3", &"s".repeat(40)] {
+        assert!(!text.contains(secret), "{secret} leaked: {text}");
+    }
+    assert!(text.contains("\"safe_prompt\":true"), "{text}");
+    // Replaced by a placeholder at each field, not dropped.
+    let placeholder = |v: &Value| v.as_str().is_some_and(|s| s.starts_with("${AISIXSECRET_"));
+    let pk = &find(&doc, "provider_keys")[0];
+    assert!(placeholder(&pk["api_key"]), "{pk}");
+    assert!(
+        placeholder(&pk["request"]["default_headers"]["x-secondary"]),
+        "{pk}"
+    );
+    assert!(
+        placeholder(&pk["request"]["default_body_fields"]["token"]),
+        "{pk}"
+    );
+    let oidc = &find(&doc, "oidc_providers")[0];
+    assert!(placeholder(&oidc["hmac_secret"]), "{oidc}");
+}
 
-    let doc = build_export_document(&snap, false);
-    assert!(
-        doc.warnings
-            .iter()
-            .any(|w| w.contains("1 teams document") && w.contains("team_name")),
-        "{:?}",
-        doc.warnings
+#[test]
+fn two_entries_sharing_a_name_warn_about_their_placeholder() {
+    let doc = export(
+        &[
+            (
+                "provider_keys",
+                PK,
+                json!({"display_name": "same", "api_key": "a"}),
+            ),
+            (
+                "provider_keys",
+                MODEL,
+                json!({"display_name": "same", "api_key": "b"}),
+            ),
+        ],
+        false,
     );
-    assert!(
-        doc.warnings
-            .iter()
-            .any(|w| w.contains("2 users document") && w.contains("user_name")),
-        "{:?}",
-        doc.warnings
+    assert_eq!(doc.warnings.len(), 1, "{:?}", doc.warnings);
+    assert!(doc.warnings[0].contains("AISIXSECRET_PROVIDER_KEY_SAME_API_KEY"));
+}
+
+#[test]
+fn dollars_in_stored_strings_are_escaped() {
+    let doc = export(
+        &[(
+            "provider_keys",
+            PK,
+            json!({"display_name": "costs $5", "api_key": "x"}),
+        )],
+        true,
     );
-    assert!(doc.blocking.is_empty(), "{:?}", doc.blocking);
-    // Nothing else warns about an empty snapshot.
-    assert!(build_export_document(&AisixSnapshot::new(), false)
-        .warnings
-        .is_empty());
+    assert_eq!(
+        find(&doc, "provider_keys")[0]["display_name"],
+        json!("costs $$5")
+    );
+}
+
+const TEAM: &str = "1b2c3d4e-5f60-4718-8a9b-0c1d2e3f4a5b";
+const USER: &str = "2c3d4e5f-6071-4829-9bac-1d2e3f4a5b6c";
+const ENV: &str = "3d4e5f60-7182-493a-acbd-2e3f4a5b6c7d";
+const PRICE: &str = "4e5f6071-8293-4a4b-bdce-3f4a5b6c7d8e";
+const CATALOG_PRICE: &str = "5f607182-93a4-4b5c-8edf-4a5b6c7d8e9f";
+const BUDGET: &str = "60718293-a4b5-4c6d-9fe0-5b6c7d8e9fa0";
+
+/// One document of every kind beside the ones `rows()` carries that the
+/// gateway reads, the catalog price under the global prefix.
+fn every_other_kind() -> Vec<RawEntry> {
+    [
+        ("/aisix/teams", TEAM, json!({"name": "eng"})),
+        ("/aisix/users", USER, json!({"name": "ana"})),
+        (
+            "/aisix/budget_policy",
+            ENV,
+            json!({"fail_mode": "closed", "closed_grace_seconds": 600}),
+        ),
+        (
+            "/aisix/usage_accounting",
+            ENV,
+            json!({"exclude_estimated_usage": true}),
+        ),
+        (
+            "/aisix/pricing",
+            PRICE,
+            json!({"key": "openai/gpt-4o", "input_per_1k": 5, "output_per_1k": 15}),
+        ),
+        (
+            "/aisix/global/pricing",
+            CATALOG_PRICE,
+            json!({"key": "openai/gpt-4o", "input_per_1k": 2.5, "output_per_1k": 10}),
+        ),
+        (
+            "/aisix/budgets",
+            BUDGET,
+            json!({"scope": "api_key", "scope_ref": KEY, "period": "month", "exhausted": {"reason": {}}}),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(i, (prefix, id, value))| RawEntry {
+        key: format!("{prefix}/{id}"),
+        value: serde_json::to_vec(&value).unwrap(),
+        revision: i as i64 + 100,
+    })
+    .collect()
+}
+
+/// `aisix export` over raw etcd rows, environment and global prefix both.
+fn export_entries(entries: &[RawEntry]) -> ExportDocument {
+    let prefixes = PrefixSet::new(vec![
+        WatchedPrefix::environment("/aisix"),
+        WatchedPrefix::global("/aisix/global/"),
+    ]);
+    let (snap, stats) = build_snapshot(&prefixes, entries);
+    assert!(stats.rejections.is_empty(), "{:?}", stats.rejections);
+    let (raw, notes) = stored_documents(&prefixes, entries, &stats);
+    assert!(notes.is_empty(), "{notes:?}");
+    build_export_document(&snap, &raw, false)
+}
+
+#[test]
+fn every_kind_the_gateway_reads_is_exported_except_budgets() {
+    let doc = export_entries(&every_other_kind());
+    for (kind, id) in [
+        ("teams", TEAM),
+        ("users", USER),
+        ("budget_policy", ENV),
+        ("usage_accounting", ENV),
+        ("pricing", PRICE),
+    ] {
+        assert_eq!(find(&doc, kind)[0]["id"], json!(id), "{kind}");
+    }
+    assert_eq!(
+        find(&doc, "usage_accounting")[0]["exclude_estimated_usage"],
+        json!(true)
+    );
+    assert_eq!(
+        doc.global_collections,
+        vec![(
+            "pricing",
+            vec![json!({
+                "id": CATALOG_PRICE,
+                "key": "openai/gpt-4o",
+                "input_per_1k": 2.5,
+                "output_per_1k": 10
+            })]
+        )]
+    );
+    assert!(doc.collections.iter().all(|(k, _)| *k != "budgets"));
+    assert_eq!(doc.warnings.len(), 1, "{:?}", doc.warnings);
+    assert!(
+        doc.warnings[0].contains("1 budgets document(s) not exported"),
+        "{}",
+        doc.warnings[0]
+    );
+}
+
+#[test]
+fn every_exported_kind_loads_back_from_the_file() {
+    let doc = export_entries(&every_other_kind());
+    let yaml = super::super::yaml_emit::emit_yaml(&doc).unwrap();
+    let entries = aisix_etcd::file_source::read_str(&yaml, "exported.yaml", 1, &|_| None)
+        .unwrap_or_else(|e| panic!("{e}\n{yaml}"));
+    let (loaded, stats) = build_snapshot(&aisix_etcd::file_source::prefixes(), &entries);
+    assert!(stats.rejections.is_empty(), "{:?}", stats.rejections);
+    assert!(loaded.teams.get_by_id(TEAM).is_some());
+    assert!(loaded.users.get_by_id(USER).is_some());
+    assert!(loaded.budget_policy.get_by_id(ENV).is_some());
+    assert!(loaded.excludes_estimated_usage());
+    assert!(loaded.pricing.get_by_id(PRICE).is_some());
+    assert!(loaded.global_pricing.get_by_id(CATALOG_PRICE).is_some());
+    assert!(loaded.pricing.get_by_id(CATALOG_PRICE).is_none());
+    assert!(loaded.budgets.is_empty());
+}
+
+#[test]
+fn budget_policy_export_preserves_timezone_when_set_and_omits_when_absent() {
+    let env_with_tz = "718293a4-b5c6-4d7e-8f90-1a2b3c4d5e6f";
+    let entries = vec![
+        RawEntry {
+            key: format!("/aisix/budget_policy/{ENV}"),
+            value: serde_json::to_vec(&json!({"fail_mode": "sticky", "closed_grace_seconds": 300}))
+                .unwrap(),
+            revision: 1,
+        },
+        RawEntry {
+            key: format!("/aisix/budget_policy/{env_with_tz}"),
+            value: serde_json::to_vec(&json!({
+                "fail_mode": "closed",
+                "closed_grace_seconds": 600,
+                "timezone": "Asia/Shanghai"
+            }))
+            .unwrap(),
+            revision: 2,
+        },
+    ];
+    let doc = export_entries(&entries);
+    let policies = find(&doc, "budget_policy");
+    let without = policies.iter().find(|v| v["id"] == json!(ENV)).unwrap();
+    let with_tz = policies
+        .iter()
+        .find(|v| v["id"] == json!(env_with_tz))
+        .unwrap();
+    assert!(without.get("timezone").is_none());
+    assert_eq!(with_tz["timezone"], json!("Asia/Shanghai"));
+
+    let yaml = super::super::yaml_emit::emit_yaml(&doc).unwrap();
+    let reloaded = aisix_etcd::file_source::read_str(&yaml, "exported.yaml", 1, &|_| None)
+        .unwrap_or_else(|e| panic!("{e}\n{yaml}"));
+    let (loaded, stats) = build_snapshot(&aisix_etcd::file_source::prefixes(), &reloaded);
+    assert!(stats.rejections.is_empty(), "{:?}", stats.rejections);
+    assert_eq!(
+        loaded.budget_policy.get_by_id(ENV).unwrap().value.timezone,
+        None
+    );
+    assert_eq!(
+        loaded
+            .budget_policy
+            .get_by_id(env_with_tz)
+            .unwrap()
+            .value
+            .timezone
+            .as_deref(),
+        Some("Asia/Shanghai")
+    );
+}
+
+#[test]
+fn documents_are_written_as_stored_not_re_serialized() {
+    // The typed model would add every default (`endpoint: null` among them,
+    // which the read schema refuses); the file carries what etcd carries.
+    let doc = export(
+        &[(
+            "guardrails",
+            POLICY,
+            json!({"name": "mod", "kind": "openai_moderation", "api_key": "sk-x"}),
+        )],
+        true,
+    );
+    assert_eq!(
+        find(&doc, "guardrails")[0],
+        json!({"id": POLICY, "name": "mod", "kind": "openai_moderation", "api_key": "sk-x"})
+    );
+}
+
+#[test]
+fn the_id_comes_from_the_key_not_from_a_stored_id_field() {
+    let doc = export(
+        &[(
+            "provider_keys",
+            PK,
+            json!({"display_name": "pk", "api_key": "x", "id": GONE}),
+        )],
+        true,
+    );
+    assert_eq!(find(&doc, "provider_keys")[0]["id"], json!(PK));
+}
+
+#[test]
+fn a_custom_guardrail_secret_named_like_a_credential_gets_one_placeholder() {
+    let doc = export(
+        &[(
+            "guardrails",
+            POLICY,
+            json!({
+                "name": "screen",
+                "kind": "custom",
+                "script": "export async function checkInput() { return { action: \"none\" }; }",
+                "secrets": {"api_key": "tok-live"}
+            }),
+        )],
+        false,
+    );
+    assert_eq!(
+        doc.secret_placeholders.len(),
+        1,
+        "{:?}",
+        doc.secret_placeholders
+    );
+    assert_eq!(
+        find(&doc, "guardrails")[0]["secrets"]["api_key"],
+        json!(format!("${{{}}}", doc.secret_placeholders[0].env_var))
+    );
+}
+
+#[test]
+fn a_custom_guardrail_s_script_secrets_are_redacted() {
+    let doc = export(
+        &[(
+            "guardrails",
+            POLICY,
+            json!({
+                "name": "screen",
+                "kind": "custom",
+                "script": "export async function checkInput() { return { action: \"none\" }; }",
+                "secrets": {"SCREENING_TOKEN": "tok-live-secret"}
+            }),
+        )],
+        false,
+    );
+    let gr = &find(&doc, "guardrails")[0];
+    assert!(!gr.to_string().contains("tok-live-secret"), "{gr}");
+    assert!(gr["secrets"]["SCREENING_TOKEN"]
+        .as_str()
+        .unwrap()
+        .starts_with("${AISIXSECRET_"));
+}
+
+#[test]
+fn a_model_priced_by_a_key_no_exported_pricing_document_carries_is_reported() {
+    let mut rows = rows();
+    rows[1].2["pricing_key"] = json!("openai/gpt-4o");
+    let doc = export(&rows, false);
+    assert_eq!(doc.warnings.len(), 1, "{:?}", doc.warnings);
+    assert!(
+        doc.warnings[0].contains("carries no price"),
+        "{}",
+        doc.warnings[0]
+    );
+    rows[1].2["cost"] = json!({"input_per_1k": 1, "output_per_1k": 2});
+    let with_cost = export(&rows, false);
+    assert!(
+        with_cost.warnings[0].contains("falls back to its inline `cost`"),
+        "{}",
+        with_cost.warnings[0]
+    );
+    rows.push((
+        "pricing",
+        PRICE,
+        json!({"key": "openai/gpt-4o", "input_per_1k": 5, "output_per_1k": 15}),
+    ));
+    let priced = export(&rows, false);
+    assert!(priced.warnings.is_empty(), "{:?}", priced.warnings);
+}
+
+#[test]
+fn of_two_prices_sharing_a_key_only_the_one_the_gateway_applies_is_exported() {
+    // The newer row has the smaller id, so a file that stamps both with one
+    // revision would apply the older price.
+    let older = "ffffffff-0000-4000-8000-000000000000";
+    let newer = "00000000-ffff-4000-8000-000000000000";
+    let entries: Vec<RawEntry> = [(older, 1, 1), (newer, 2, 9)]
+        .into_iter()
+        .map(|(id, revision, price)| RawEntry {
+            key: format!("/aisix/global/pricing/{id}"),
+            value: serde_json::to_vec(
+                &json!({"key": "openai/gpt-4o", "input_per_1k": price, "output_per_1k": price}),
+            )
+            .unwrap(),
+            revision,
+        })
+        .collect();
+    let doc = export_entries(&entries);
+    let rows = &doc.global_collections[0].1;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["id"], json!(newer));
+    assert_eq!(rows[0]["input_per_1k"], json!(9));
+    assert_eq!(doc.warnings.len(), 1, "{:?}", doc.warnings);
+    assert!(doc.warnings[0].contains(older), "{}", doc.warnings[0]);
+}
+
+#[test]
+fn two_fields_of_one_entry_sharing_a_placeholder_are_reported() {
+    let doc = export(
+        &[(
+            "provider_keys",
+            PK,
+            json!({
+                "display_name": "pk",
+                "api_key": "a",
+                "request": {"default_headers": {"x-tenant-token": "t1", "x_tenant_token": "t2"}}
+            }),
+        )],
+        false,
+    );
+    assert_eq!(doc.warnings.len(), 1, "{:?}", doc.warnings);
+    assert!(
+        doc.warnings[0].contains("same environment variable"),
+        "{}",
+        doc.warnings[0]
+    );
+}
+
+#[test]
+fn fields_the_gateway_ignores_are_left_out_of_the_stored_documents() {
+    let entries = vec![RawEntry {
+        key: format!("/aisix/provider_keys/{PK}"),
+        value: serde_json::to_vec(&json!({
+            "display_name": "pk",
+            "api_key": "x",
+            "access_token": "tok-left-over",
+            "secret": "tok-retired-spelling",
+            "request": {"timeout_hint": "tok-nested"}
+        }))
+        .unwrap(),
+        revision: 1,
+    }];
+    let prefixes = PrefixSet::new(vec![WatchedPrefix::environment("/aisix")]);
+    let (_, stats) = build_snapshot(&prefixes, &entries);
+    let (docs, notes) = stored_documents(&prefixes, &entries, &stats);
+    let doc = &docs[&("provider_keys".to_string(), PK.to_string())];
+    let text = serde_json::to_string(doc).unwrap();
+    assert!(
+        !text.contains("tok-left-over")
+            && !text.contains("tok-retired-spelling")
+            && !text.contains("tok-nested"),
+        "{text}"
+    );
+    assert_eq!(doc["api_key"], json!("x"));
+    assert_eq!(notes.len(), 1, "{notes:?}");
 }

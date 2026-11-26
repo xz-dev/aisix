@@ -21,6 +21,8 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
+import { funAsrPath, openFunAsr, recognize, startFunAsrUpstream } from "../harness/fun-asr.js";
+
 // Every client-facing proxy route emits every per-request metric family,
 // unless the quantity the family measures does not exist on that route
 // (AISIX-Cloud#1935). The table below is that contract: one row per route
@@ -32,6 +34,8 @@ import {
 // by leaving it out, with the reason beside the row.
 
 const CALLER = "sk-metric-parity-caller";
+const CLIENT_TYPE = "parity-client";
+const USER_AGENT = `${CLIENT_TYPE}/1.0`;
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
 
 /** A per-request family and how its samples are matched for one row. */
@@ -52,6 +56,7 @@ interface Row {
   name: string;
   /** The metric `endpoint` label the route records under. */
   endpoint: string;
+  protocols?: { inbound_protocol: string; upstream_protocol: string };
   /** The model the row's model-keyed families attribute to, if any. */
   model?: string;
   families: Family[];
@@ -337,6 +342,7 @@ describe("every proxy route emits every per-request metric family", () => {
   let app: SpawnedApp | undefined;
   let upstream: Awaited<ReturnType<typeof startUpstream>> | undefined;
   let realtime: Awaited<ReturnType<typeof startRealtimeUpstream>> | undefined;
+  let asr: Awaited<ReturnType<typeof startFunAsrUpstream>> | undefined;
   let mcp: McpUpstream | undefined;
   let a2a: A2aUpstream | undefined;
   let etcdReachable = false;
@@ -344,7 +350,7 @@ describe("every proxy route emits every per-request metric family", () => {
   const jobs = { fileId: "", batchId: "", ftId: "" };
   let videoId = "";
 
-  const auth = (token = CALLER) => ({ authorization: `Bearer ${token}` });
+  const auth = (token = CALLER) => ({ authorization: `Bearer ${token}`, "user-agent": USER_AGENT });
 
   async function call(path: string, init: RequestInit = {}, token = CALLER): Promise<Response> {
     const res = await fetch(`${app!.proxyUrl}${path}`, {
@@ -405,6 +411,21 @@ describe("every proxy route emits every per-request metric family", () => {
 
   const jobsModel = { "x-aisix-model": "par-jobs" };
 
+  const geminiCalls = [
+    { route: "/v1beta/models/*model_action", modelPath: "/v1beta/models/par-chat" },
+    {
+      route: "/v1beta1/projects/:project/locations/:location/publishers/google/models/*model_action",
+      modelPath: "/v1beta1/projects/local/locations/us-central1/publishers/google/models/par-chat",
+    },
+  ].flatMap(({ route, modelPath }) =>
+    ["generateContent", "streamGenerateContent"].map((action) => ({
+      route,
+      path: `${modelPath}:${action}`,
+      endpoint: `/v1beta/models/:model:${action}`,
+      stream: action === "streamGenerateContent",
+    })),
+  );
+
   const ROWS: Row[] = [
     { route: "/v1/models", name: "GET /v1/models", endpoint: "/v1/models", families: [...REQUEST], drive: async () => void (await expectCall("/v1/models")) },
     {
@@ -424,6 +445,17 @@ describe("every proxy route emits every per-request metric family", () => {
       drive: async () =>
         void (await postJson("/v1/chat/completions", { model: "par-chat", stream: true, stream_options: { include_usage: true }, messages: [{ role: "user", content: "hi" }] })),
     },
+    ...geminiCalls.map(({ route, path, endpoint, stream }): Row => ({
+      route,
+      name: path,
+      endpoint,
+      protocols: { inbound_protocol: "gemini", upstream_protocol: "openai" },
+      model: "par-chat",
+      families: stream ? [...MODEL_ROUTE, "tokens", "ttft"] : [...MODEL_ROUTE, "tokens"],
+      drive: async () => void (await postJson(stream ? `${path}?alt=sse` : path, {
+        contents: [{ role: "user", parts: [{ text: "hi" }] }],
+      })),
+    })),
     {
       route: "/v1/completions",
       name: "completions",
@@ -612,10 +644,10 @@ describe("every proxy route emits every per-request metric family", () => {
       model: "par-realtime",
       families: ["proxy_requests", "llm_requests", "tokens", "deployment", "ratelimit_remaining"],
       drive: async () => {
-        const ws = new WebSocket(`${app!.proxyUrl.replace("http", "ws")}/v1/realtime?model=par-realtime`, [
-          "realtime",
-          `openai-insecure-api-key.${CALLER}`,
-        ]);
+        const ws = new WebSocket(`${app!.proxyUrl.replace("http", "ws")}/v1/realtime?model=par-realtime`, {
+          protocols: ["realtime", `openai-insecure-api-key.${CALLER}`],
+          headers: { "user-agent": USER_AGENT },
+        });
         await new Promise<void>((resolve, reject) => {
           const timer = setTimeout(() => reject(new Error("realtime session timed out")), 15_000);
           ws.addEventListener("open", () => ws.send(JSON.stringify({ type: "response.create" })));
@@ -629,6 +661,20 @@ describe("every proxy route emits every per-request metric family", () => {
             reject(new Error(`realtime session errored: ${String(e)}`));
           });
         });
+      },
+    },
+    {
+      // DashScope measures an ASR task in audio seconds and reports no tokens.
+      route: funAsrPath, endpoint: funAsrPath, name: "Fun-ASR", model: "par-funasr",
+      protocols: { inbound_protocol: "dashscope", upstream_protocol: "openai" },
+      families: [...REQUEST, "llm_requests", "e2e_upstream", "deployment", "ratelimit_remaining"],
+      drive: async () => {
+        const client = await openFunAsr(app!.proxyUrl, CALLER);
+        try {
+          expect((await recognize(client, "par-funasr")).frames.at(-1).header.event).toBe("task-finished");
+        } finally {
+          client.ws.close();
+        }
       },
     },
     // Files / batches / fine-tuning: management calls, outside the LLM tier.
@@ -850,6 +896,7 @@ describe("every proxy route emits every per-request metric family", () => {
   const AUTH_ROUTES: Array<[string, string, string]> = [
     ["GET", "/v1/models", "/v1/models"],
     ["POST", "/v1/chat/completions", "/v1/chat/completions"],
+    ...geminiCalls.map(({ path, endpoint }): [string, string, string] => ["POST", path, endpoint]),
     ["POST", "/v1/completions", "/v1/completions"],
     ["POST", "/v1/embeddings", "/v1/embeddings"],
     ["POST", "/v1/images/generations", "/v1/images/generations"],
@@ -884,16 +931,19 @@ describe("every proxy route emits every per-request metric family", () => {
 
     upstream = await startUpstream();
     realtime = await startRealtimeUpstream();
+    asr = await startFunAsrUpstream();
     mcp = await startMcpUpstream("alpha");
     a2a = await startA2aUpstream({ streamAnswer: true });
-    app = await spawnApp();
+    app = await spawnApp({
+      clientTypeRules: [{ pattern: `^${CLIENT_TYPE}/`, client: CLIENT_TYPE }],
+    });
     const seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const openaiPk = await seed.createProviderKey({ display_name: "par-openai-pk", secret: "sk-mock", api_base: `${upstream.baseUrl}/v1`, provider: "openai" });
-    const soraPk = await seed.createProviderKey({ display_name: "par-sora-pk", secret: "sk-mock", api_base: upstream.baseUrl, provider: "openai" });
-    const anthropicPk = await seed.createProviderKey({ display_name: "par-anthropic-pk", secret: "sk-ant", api_base: upstream.baseUrl });
-    const typesafePk = await seed.createProviderKey({ display_name: "par-typesafe-pk", provider: "typesafe", adapter: undefined, secret: "ts", api_base: upstream.baseUrl });
-    const realtimePk = await seed.createProviderKey({ display_name: "par-realtime-pk", secret: "sk-mock", api_base: `http://127.0.0.1:${realtime.port}/v1` });
+    const openaiPk = await seed.createProviderKey({ display_name: "par-openai-pk", api_key: "sk-mock", api_base: `${upstream.baseUrl}/v1`, provider: "openai" });
+    const soraPk = await seed.createProviderKey({ display_name: "par-sora-pk", api_key: "sk-mock", api_base: upstream.baseUrl, provider: "openai" });
+    const anthropicPk = await seed.createProviderKey({ display_name: "par-anthropic-pk", api_key: "sk-ant", api_base: upstream.baseUrl });
+    const typesafePk = await seed.createProviderKey({ display_name: "par-typesafe-pk", provider: "typesafe", adapter: undefined, api_key: "ts", api_base: upstream.baseUrl });
+    const realtimePk = await seed.createProviderKey({ display_name: "par-realtime-pk", api_key: "sk-mock", api_base: `http://127.0.0.1:${realtime.port}/v1` });
 
     const model = (display_name: string, model_name: string, provider_key_id: string, provider = "openai") =>
       seed.createModel({ display_name, provider, model_name, provider_key_id });
@@ -910,9 +960,11 @@ describe("every proxy route emits every per-request metric family", () => {
     await model("par-tts", "tts-1", openaiPk.id);
     await model("par-video", "sora-2", soraPk.id);
     await model("par-realtime", "gpt-realtime-mock", realtimePk.id);
+    const asrPk = await seed.createProviderKey({ display_name: "asr-pk", provider: "alibaba", api_key: "sk-mock", api_base: asr.base });
+    await model("par-funasr", "fun-asr-realtime", asrPk.id, "alibaba");
     await model("par-jobs", "gpt-4o", openaiPk.id);
 
-    await seed.update("mcp_servers", randomUUID(), { display_name: "alpha", url: mcp.url, enabled: true });
+    await seed.update("mcp_servers", randomUUID(), { name: "alpha", url: mcp.url, enabled: true });
     await seed.update("a2a_agents", randomUUID(), { name: "par-agent", url: a2a.url, protocol_version: "1.0", auth_type: "none", enabled: true });
     await seed.createPassthroughRoute({ name: "par-ptr", path_prefix: "/passthrough/parity", target_url: `${upstream.baseUrl}/v1`, provider_key_id: openaiPk.id });
 
@@ -934,6 +986,7 @@ describe("every proxy route emits every per-request metric family", () => {
     await app?.exit();
     await upstream?.close();
     await realtime?.close();
+    await asr?.close();
     await mcp?.close();
     await a2a?.close();
   });
@@ -944,11 +997,12 @@ describe("every proxy route emits every per-request metric family", () => {
   function moved(row: Row, family: Family, before: MetricSample[], after: MetricSample[]): number {
     const d = (name: string, want: Record<string, string>) => metricDelta(before, after, name, want);
     const ep = { endpoint: row.endpoint };
+    const protocolLabels = { ...ep, ...row.protocols };
     switch (family) {
       case "proxy_requests":
-        return d("aisix_proxy_requests_total", ep);
+        return d("aisix_proxy_requests_total", protocolLabels);
       case "llm_requests":
-        return d("aisix_llm_requests_total", ep);
+        return d("aisix_llm_requests_total", protocolLabels);
       case "e2e_downstream":
         return d("aisix_request_e2e_latency_seconds_count", { ...ep, side: "downstream" });
       case "e2e_upstream":
@@ -956,14 +1010,14 @@ describe("every proxy route emits every per-request metric family", () => {
       case "ttft":
         return Math.min(
           d("aisix_request_ttft_seconds_count", { ...ep, side: "upstream" }),
-          d("aisix_llm_time_to_first_token_seconds_count", { ...ep, side: "upstream" }),
+          d("aisix_llm_time_to_first_token_seconds_count", { ...protocolLabels, side: "upstream" }),
         );
       case "tokens": {
         const model = { model: row.model ?? "" };
         return Math.min(
-          d("aisix_llm_input_tokens_total", ep),
+          d("aisix_llm_input_tokens_total", protocolLabels),
           d("aisix_tokens_consumed_total", model),
-          d("aisix_llm_tokens_by_client_total", model),
+          d("aisix_llm_tokens_by_client_total", { ...model, client_type: CLIENT_TYPE }),
         );
       }
       case "deployment":
@@ -1009,6 +1063,39 @@ describe("every proxy route emits every per-request metric family", () => {
     }
     expect(failures, "route × family cells that did not move").toEqual([]);
   }, 180_000);
+
+  test("the MCP surface, its OAuth discovery documents included, is counted as mcp", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const mcpRoutes = [
+      "/mcp",
+      "/mcp/",
+      "/mcp/:server",
+      "/.well-known/oauth-protected-resource",
+      "/.well-known/oauth-protected-resource/mcp",
+      "/.well-known/oauth-protected-resource/mcp/:server",
+      "/.well-known/oauth-authorization-server/mcp/:server",
+      "/mcp/:server/.well-known/openid-configuration",
+      "/mcp/:server/.well-known/jwks.json",
+      "/mcp/:server/oauth/register",
+      "/mcp/:server/oauth/authorize",
+      "/mcp/:server/oauth/token",
+      "/mcp/:server/oauth/credential",
+      "/mcp-oauth/callback",
+      "/mcp-oauth/login/callback",
+      "/mcp-oauth/consent",
+    ];
+    const mcpRows = ROWS.filter((r) => mcpRoutes.includes(r.route));
+    expect(mcpRows.map((r) => r.route)).toEqual(expect.arrayContaining(mcpRoutes));
+    const failures: string[] = [];
+    for (const row of mcpRows) {
+      const before = await scrape();
+      await row.drive();
+      const after = await scrape();
+      const want = { endpoint: row.endpoint, inbound_protocol: "mcp" };
+      if (metricDelta(before, after, "aisix_proxy_requests_total", want) <= 0) failures.push(row.name);
+    }
+    expect(failures, "MCP rows not counted under inbound_protocol=mcp").toEqual([]);
+  }, 60_000);
 
   test("an authentication denial is counted on every extractor-authenticated route", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();

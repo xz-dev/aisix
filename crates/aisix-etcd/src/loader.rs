@@ -36,7 +36,8 @@ use aisix_core::models::{
 };
 use aisix_core::models::{
     validate_budget_lenient, validate_budget_policy_lenient, validate_pricing_lenient,
-    validate_team_lenient, validate_user_lenient, Budget, BudgetPolicy, Pricing, Team, User,
+    validate_team_lenient, validate_usage_accounting_lenient, validate_user_lenient, Budget,
+    BudgetPolicy, Pricing, Team, UsageAccounting, User,
 };
 use aisix_core::resource::ResourceEntry;
 use aisix_core::AisixSnapshot;
@@ -540,15 +541,28 @@ pub fn build_snapshot(prefixes: &PrefixSet, entries: &[RawEntry]) -> (AisixSnaps
                 }
             }
             "budget_policy" => {
-                if let Some(entry) = validate_and_parse::<BudgetPolicy>(
+                if let Some(entry) = validate_and_parse_with_semantics::<BudgetPolicy>(
                     &raw.key,
                     raw.revision,
                     parsed,
                     &value,
                     validate_budget_policy_lenient,
+                    BudgetPolicy::validate_semantics,
                     &mut stats,
                 ) {
                     snapshot.budget_policy.insert(entry);
+                }
+            }
+            "usage_accounting" => {
+                if let Some(entry) = validate_and_parse::<UsageAccounting>(
+                    &raw.key,
+                    raw.revision,
+                    parsed,
+                    &value,
+                    validate_usage_accounting_lenient,
+                    &mut stats,
+                ) {
+                    snapshot.usage_accounting.insert(entry);
                 }
             }
             "pricing" => {
@@ -1075,7 +1089,7 @@ mod tests {
 
     const VALID_PROVIDER_KEY: &[u8] = br#"{
         "display_name": "openai-mock",
-        "secret": "sk-test-not-real",
+        "api_key": "sk-test-not-real",
         "api_base": "http://mock-llm:8000/v1",
         "provider": "openai"
     }"#;
@@ -1103,7 +1117,7 @@ mod tests {
         // ever reaching dispatch.
         let entries = vec![raw(
             "/aisix/provider_keys/pk-bedrock",
-            br#"{"display_name":"bedrock-pk","secret":"x","provider":"amazon-bedrock","aws_region":"us-east-1"}"#,
+            br#"{"display_name":"bedrock-pk","api_key":"x","provider":"amazon-bedrock","aws_region":"us-east-1"}"#,
             1,
         )];
         let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
@@ -1128,7 +1142,7 @@ mod tests {
         // fields — YELLOW load, fields reported.
         let entries = vec![raw(
             "/aisix/provider_keys/pk-vertex",
-            br#"{"display_name":"vertex-pk","secret":"x","provider":"google-vertex","gcp_project":"my-proj","gcp_region":"us-central1"}"#,
+            br#"{"display_name":"vertex-pk","api_key":"x","provider":"google-vertex","gcp_project":"my-proj","gcp_region":"us-central1"}"#,
             1,
         )];
         let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
@@ -1154,31 +1168,25 @@ mod tests {
     #[test]
     fn provider_key_azure_resource_payload_loads_partially_compatible() {
         // Same decision as aws_region: the Azure bridge derives the
-        // resource name from `api_base` and pins its own API version —
-        // neither top-level field is consumed — YELLOW load, fields
-        // reported.
+        // resource name from `api_base`, so `azure_resource_name` is not
+        // consumed — YELLOW load, field reported. `api_version` is a
+        // Provider Key field and is not reported.
         let entries = vec![raw(
             "/aisix/provider_keys/pk-azure",
-            br#"{"display_name":"azure-pk","secret":"x","provider":"azure","azure_resource_name":"my-azure","api_version":"2024-02-01"}"#,
+            br#"{"display_name":"azure-pk","api_key":"x","provider":"azure","azure_resource_name":"my-azure","api_version":"2024-02-01"}"#,
             1,
         )];
         let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.accepted, 1, "rejections: {:?}", stats.rejections);
-        assert!(snap.provider_keys.get_by_id("pk-azure").is_some());
+        let pk = snap.provider_keys.get_by_id("pk-azure").unwrap();
+        assert_eq!(pk.value.api_version.as_deref(), Some("2024-02-01"));
         assert_eq!(
             stats.partially_compatible,
-            vec![
-                PartialCompatEntry {
-                    kind: "provider_keys".into(),
-                    field: "api_version".into(),
-                    count: 1,
-                },
-                PartialCompatEntry {
-                    kind: "provider_keys".into(),
-                    field: "azure_resource_name".into(),
-                    count: 1,
-                },
-            ]
+            vec![PartialCompatEntry {
+                kind: "provider_keys".into(),
+                field: "azure_resource_name".into(),
+                count: 1,
+            }]
         );
     }
 
@@ -1508,17 +1516,25 @@ mod tests {
         assert_eq!(fields.last().map(String::as_str), Some("...truncated"));
     }
 
-    // ---- renamed-field dual acceptance ----
+    // ---- retired field names (#1375) ----
     //
-    // provider_key `secret`→`api_key` and mcp_server / a2a_agent
-    // `display_name`→`name`: documents written under the former names
-    // (existing etcd data a control plane left before 1.8.0) and documents
-    // written under the canonical names must BOTH pass this loader's
-    // schema gate and serde parse. A regression here silently drops
-    // resources from the snapshot in managed mode.
+    // provider_key `secret` (now `api_key`) and `display_name` on
+    // mcp_server, a2a_agent and passthrough_route (now `name`) are no
+    // longer read: a document carrying only the old name is missing a
+    // required field and is rejected whole, while its canonical twin in
+    // the same batch still loads.
 
     #[test]
-    fn provider_key_accepts_both_credential_spellings() {
+    fn documents_under_retired_field_names_are_rejected() {
+        let route = |name_key: &str| {
+            serde_json::json!({
+                name_key: "route",
+                "path_prefix": "/passthrough/x",
+                "target_url": "https://erp.internal",
+                "provider_key_id": "11111111-1111-1111-1111-111111111111"
+            })
+            .to_string()
+        };
         let entries = vec![
             raw(
                 "/aisix/provider_keys/pk-former",
@@ -1530,76 +1546,58 @@ mod tests {
                 br#"{"display_name":"pk-canonical","api_key":"sk-x"}"#,
                 2,
             ),
-        ];
-        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
-        assert_eq!(stats.accepted, 2, "rejections: {:?}", stats.rejections);
-        assert_eq!(snap.provider_keys.len(), 2);
-        // Both spellings land on the same typed field.
-        for id in ["pk-former", "pk-canonical"] {
-            let entry = snap.provider_keys.get_by_id(id).unwrap();
-            assert_eq!(entry.value.api_key, "sk-x");
-        }
-    }
-
-    #[test]
-    fn provider_key_with_both_spellings_is_rejected_as_parse_failure() {
-        // The schema's `anyOf` admits a document carrying both spellings;
-        // serde then rejects it as a duplicate field (both names map to
-        // the same field), so the ambiguous row is skipped — not loaded
-        // with one value silently winning — and the batch continues.
-        let entries = vec![
-            raw(
-                "/aisix/provider_keys/pk-ambiguous",
-                br#"{"display_name":"pk-a","api_key":"sk-new","secret":"sk-old"}"#,
-                1,
-            ),
-            raw(
-                "/aisix/provider_keys/pk-good",
-                br#"{"display_name":"pk-good","api_key":"sk-x"}"#,
-                2,
-            ),
-        ];
-        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
-        assert_eq!(stats.schema_rejected, 0);
-        assert_eq!(stats.parse_rejected, 1);
-        assert_eq!(stats.accepted, 1);
-        assert_eq!(stats.rejections.len(), 1);
-        assert_eq!(stats.rejections[0].kind, RejectionKind::ParseFailed);
-        assert!(snap.provider_keys.get_by_id("pk-good").is_some());
-        assert!(snap.provider_keys.get_by_id("pk-ambiguous").is_none());
-    }
-
-    #[test]
-    fn mcp_server_and_a2a_agent_accept_both_label_spellings() {
-        let entries = vec![
             raw(
                 "/aisix/mcp_servers/mcp-former",
                 br#"{"display_name":"gh-former","url":"https://x/mcp"}"#,
-                1,
+                3,
             ),
             raw(
                 "/aisix/mcp_servers/mcp-canonical",
                 br#"{"name":"gh-canonical","url":"https://x/mcp"}"#,
-                2,
+                4,
             ),
             raw(
                 "/aisix/a2a_agents/a2a-former",
                 br#"{"display_name":"agent-former","url":"https://x/a2a"}"#,
-                3,
+                5,
             ),
             raw(
                 "/aisix/a2a_agents/a2a-canonical",
                 br#"{"name":"agent-canonical","url":"https://x/a2a"}"#,
-                4,
+                6,
+            ),
+            raw(
+                "/aisix/passthrough_routes/pr-former",
+                route("display_name").as_bytes(),
+                7,
+            ),
+            raw(
+                "/aisix/passthrough_routes/pr-canonical",
+                route("name").as_bytes(),
+                8,
             ),
         ];
         let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.accepted, 4, "rejections: {:?}", stats.rejections);
-        // The name index is fed by the renamed field for both spellings.
-        assert!(snap.mcp_servers.get_by_name("gh-former").is_some());
+        let mut rejected: Vec<&str> = stats.rejections.iter().map(|r| r.key.as_str()).collect();
+        rejected.sort_unstable();
+        assert_eq!(
+            rejected,
+            [
+                "/aisix/a2a_agents/a2a-former",
+                "/aisix/mcp_servers/mcp-former",
+                "/aisix/passthrough_routes/pr-former",
+                "/aisix/provider_keys/pk-former",
+            ]
+        );
+        assert!(stats
+            .rejections
+            .iter()
+            .all(|r| r.kind == RejectionKind::SchemaFailed));
+        assert!(snap.provider_keys.get_by_id("pk-canonical").is_some());
         assert!(snap.mcp_servers.get_by_name("gh-canonical").is_some());
-        assert!(snap.a2a_agents.get_by_name("agent-former").is_some());
         assert!(snap.a2a_agents.get_by_name("agent-canonical").is_some());
+        assert!(snap.passthrough_routes.get_by_id("pr-canonical").is_some());
     }
 
     #[test]
@@ -1808,6 +1806,120 @@ mod tests {
                 .closed_grace_seconds,
             120
         );
+    }
+
+    #[test]
+    fn budget_policy_rejects_invalid_timezone_and_accepts_valid_ones() {
+        let entries = vec![
+            raw(
+                "/aisix/budget_policy/valid-shanghai",
+                br#"{"fail_mode":"sticky","closed_grace_seconds":300,"timezone":"Asia/Shanghai"}"#,
+                1,
+            ),
+            raw(
+                "/aisix/budget_policy/valid-utc",
+                br#"{"fail_mode":"sticky","closed_grace_seconds":300,"timezone":"UTC"}"#,
+                2,
+            ),
+            raw(
+                "/aisix/budget_policy/valid-absent",
+                br#"{"fail_mode":"sticky","closed_grace_seconds":300}"#,
+                3,
+            ),
+            raw(
+                "/aisix/budget_policy/bad-empty",
+                br#"{"fail_mode":"sticky","closed_grace_seconds":300,"timezone":""}"#,
+                4,
+            ),
+            raw(
+                "/aisix/budget_policy/bad-local",
+                br#"{"fail_mode":"sticky","closed_grace_seconds":300,"timezone":"Local"}"#,
+                5,
+            ),
+            raw(
+                "/aisix/budget_policy/bad-unknown",
+                br#"{"fail_mode":"sticky","closed_grace_seconds":300,"timezone":"Mars/Olympus"}"#,
+                6,
+            ),
+            raw(
+                "/aisix/budget_policy/bad-padded",
+                br#"{"fail_mode":"sticky","closed_grace_seconds":300,"timezone":" Asia/Shanghai"}"#,
+                7,
+            ),
+        ];
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
+        assert_eq!(stats.accepted, 3, "{:?}", stats.rejections);
+        assert_eq!(stats.schema_rejected, 4);
+        assert_eq!(
+            snap.budget_policy
+                .get_by_id("valid-shanghai")
+                .unwrap()
+                .value
+                .timezone
+                .as_deref(),
+            Some("Asia/Shanghai")
+        );
+        assert_eq!(
+            snap.budget_policy
+                .get_by_id("valid-utc")
+                .unwrap()
+                .value
+                .timezone
+                .as_deref(),
+            Some("UTC")
+        );
+        assert_eq!(
+            snap.budget_policy
+                .get_by_id("valid-absent")
+                .unwrap()
+                .value
+                .timezone,
+            None
+        );
+        for bad in ["bad-empty", "bad-local", "bad-unknown", "bad-padded"] {
+            assert!(snap.budget_policy.get_by_id(bad).is_none());
+            let key = format!("/aisix/budget_policy/{bad}");
+            let r = stats
+                .rejections
+                .iter()
+                .find(|r| r.key == key)
+                .unwrap_or_else(|| panic!("missing rejection for {key}"));
+            assert_eq!(r.kind, RejectionKind::SchemaFailed);
+            assert!(r.error.contains("IANA timezone"), "{}", r.error);
+        }
+    }
+
+    #[test]
+    fn usage_accounting_loads_by_its_key_id() {
+        let entries = vec![
+            raw(
+                "/aisix/usage_accounting/env-1",
+                br#"{"exclude_estimated_usage":true}"#,
+                1,
+            ),
+            // Required on write only: a stored document without the field
+            // loads with the switch off.
+            raw("/aisix/usage_accounting/env-2", br#"{}"#, 2),
+        ];
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
+        assert_eq!(stats.accepted, 2, "{:?}", stats.rejections);
+        assert_eq!(stats.unknown_kind, 0);
+        assert!(
+            snap.usage_accounting
+                .get_by_id("env-1")
+                .unwrap()
+                .value
+                .exclude_estimated_usage
+        );
+        assert!(
+            !snap
+                .usage_accounting
+                .get_by_id("env-2")
+                .unwrap()
+                .value
+                .exclude_estimated_usage
+        );
+        assert!(snap.excludes_estimated_usage());
     }
 
     #[test]

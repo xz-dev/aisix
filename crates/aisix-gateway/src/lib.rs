@@ -34,6 +34,7 @@ pub mod chat;
 pub mod content_part;
 pub mod credential;
 pub mod dns_cache;
+pub mod gemini;
 pub mod hub;
 pub mod media_fetch;
 pub mod response_tap;
@@ -61,7 +62,8 @@ pub use bridge::{
 pub use chat::{
     CacheCreationTtl, ChatChunk, ChatDelta, ChatFormat, ChatMessage, ChatResponse, EmbeddingObject,
     EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, EmbeddingUsageSource, EmbeddingVector,
-    FinishReason, ModalityTokens, OpenAiUsageDetails, Role, ServiceTier, UsageStats,
+    FinishReason, ModalityTokens, OpenAiUsageDetails, ReportedCounts, Role, ServiceTier,
+    UsageStats,
 };
 pub use credential::credential_fingerprint;
 pub use hub::{upstream_protocol, Hub, UPSTREAM_PROTOCOL_UNKNOWN};

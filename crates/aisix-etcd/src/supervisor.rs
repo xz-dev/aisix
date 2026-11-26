@@ -70,6 +70,10 @@ struct WatchStatusInner {
     /// cheaper, but std::sync::Mutex is uncontended here (one writer,
     /// multiple readers) so the overhead is irrelevant.
     last_apply_at: Mutex<Option<Instant>>,
+    /// Per watched prefix, the revision every event under it at or below
+    /// has been processed (applied or rejected). Empty until the first
+    /// live read: a restored cache reports nothing here.
+    prefixes: Mutex<BTreeMap<String, i64>>,
 }
 
 impl Default for WatchStatusInner {
@@ -77,6 +81,7 @@ impl Default for WatchStatusInner {
         Self {
             revision: AtomicI64::new(0),
             last_apply_at: Mutex::new(None),
+            prefixes: Mutex::new(BTreeMap::new()),
         }
     }
 }
@@ -111,6 +116,26 @@ impl WatchStatus {
     pub(crate) fn record_read(&self, revision: i64) {
         self.inner.revision.store(revision, Ordering::Relaxed);
         *self.inner.last_apply_at.lock().unwrap() = Some(Instant::now());
+    }
+
+    /// A cycle's read: exactly these prefixes, each at its read revision.
+    pub(crate) fn record_prefix_reads(&self, reads: impl IntoIterator<Item = (String, i64)>) {
+        *self.inner.prefixes.lock().unwrap() = reads.into_iter().collect();
+    }
+
+    /// Events up to `revision` under `prefix` have been processed. Within
+    /// one watch stream events arrive in revision order, so the highest is
+    /// the point everything below it is covered to.
+    pub(crate) fn record_prefix_event(&self, prefix: &str, revision: i64) {
+        if let Some(slot) = self.inner.prefixes.lock().unwrap().get_mut(prefix) {
+            *slot = (*slot).max(revision);
+        }
+    }
+
+    /// Per watched prefix, the revision processing is complete to. Empty
+    /// before the first live read.
+    pub fn prefix_revisions(&self) -> BTreeMap<String, i64> {
+        self.inner.prefixes.lock().unwrap().clone()
     }
 
     /// Snapshot the current freshness state. Returns the revision and
@@ -610,6 +635,15 @@ impl<P: ConfigProvider> Supervisor<P> {
         }
     }
 
+    /// Report load state on `status` instead of a fresh etcd one — a
+    /// resources file runs through this same supervisor, and its provider
+    /// reports a reload it could not read on the same handle (see
+    /// [`crate::file_source`]).
+    pub fn with_config_status(mut self, status: ConfigStatus) -> Self {
+        self.config_status = status;
+        self
+    }
+
     /// Report the cost of every apply to `observer`.
     pub fn with_apply_observer(mut self, observer: Arc<ApplyObserver>) -> Self {
         self.apply_observer = Some(observer);
@@ -1047,20 +1081,31 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// only as far as the EARLIEST of them — see
     /// [`PrefixLoad::applied_revision`].
     async fn load_all_prefixes(&self) -> Result<PrefixLoad, ProviderError> {
-        // Deduplicated by key, because the prefixes can nest: when the
-        // gateway has no `env_id` the environment prefix is the bare base
-        // and `<base>/global/` sits inside it, so both range reads return
-        // the catalog's rows. The snapshot and the observed-state map are
-        // both keyed and would absorb the repeat, but the BuildStats are
-        // not — `accepted` and the per-field partially-compatible row
-        // counts are sums, and those numbers are reported.
+        // Each key is taken from the read of the prefix that owns it, the
+        // longest one whose read succeeded, because the prefixes can nest:
+        // with no `env_id` the environment prefix is the bare base and
+        // `<base>/global/` sits inside it, so both reads return the
+        // catalog's rows. The base is read first, so its copy is the older
+        // one, and a catalog row deleted between the two reads is in it
+        // alone — keeping it would serve the deleted row, since the watch
+        // loop leaves that delete to the catalog stream, which starts after
+        // it. Taking one copy also keeps the BuildStats sums (`accepted`,
+        // the partially-compatible row counts) from counting a row twice.
         let mut all: BTreeMap<String, RawEntry> = BTreeMap::new();
+        let mut reads: Vec<(&PrefixSource<P>, Vec<RawEntry>)> = Vec::new();
         // Per source, and not just the maximum: each prefix's watch has
         // to start from the revision ITS OWN range read was consistent
         // as of. The reads run in sequence, so a later prefix reports a
         // higher revision, and starting an earlier prefix's watch there
         // would skip every write to it in between — absent from that
-        // read and never delivered to that watch.
+        // read and never delivered to that watch. A refused prefix has
+        // none, and no watch this cycle.
+        //
+        // Each read is unpinned. Pinning a later prefix to an earlier
+        // read's revision asks the server for a revision it may not
+        // know yet: kine answers an empty range from a per-process
+        // revision cache that lags writes made by another process, and
+        // refuses a revision above it as a future one.
         let mut revisions: Vec<Option<i64>> = Vec::with_capacity(self.sources.len());
         // Retention (below) runs in a second pass so it can see the WHOLE
         // read, not just the prefixes that came before the refusal.
@@ -1071,20 +1116,7 @@ impl<P: ConfigProvider> Supervisor<P> {
                 Ok((entries, rev)) => {
                     source.clear_refusal();
                     read_ok.push(&source.prefix.prefix);
-                    for entry in entries {
-                        match all.entry(entry.key.clone()) {
-                            std::collections::btree_map::Entry::Occupied(mut slot) => {
-                                // Two reads of one key are two points in
-                                // time; keep the later write.
-                                if entry.revision > slot.get().revision {
-                                    slot.insert(entry);
-                                }
-                            }
-                            std::collections::btree_map::Entry::Vacant(slot) => {
-                                slot.insert(entry);
-                            }
-                        }
-                    }
+                    reads.push((source, entries));
                     revisions.push(Some(rev));
                 }
                 Err(err) if source.tolerates(&err) => {
@@ -1097,6 +1129,15 @@ impl<P: ConfigProvider> Supervisor<P> {
                     revisions.push(None);
                 }
                 Err(err) => return Err(err),
+            }
+        }
+
+        let owners = PrefixSet::new(reads.iter().map(|(s, _)| s.prefix.clone()).collect());
+        for (source, entries) in reads {
+            for entry in entries {
+                if owners.owns(&source.prefix.prefix, &entry.key) {
+                    all.insert(entry.key.clone(), entry);
+                }
             }
         }
 
@@ -1752,12 +1793,15 @@ impl<P: ConfigProvider> Supervisor<P> {
         // reached steady state (applied its read and opened its watches).
         let mut preceding_delay = Duration::ZERO;
         let mut steady_since = None;
+        let mut after_failure = false;
         loop {
             if *cancel.borrow() {
                 return;
             }
 
-            match self.cycle(&cancel, &mut steady_since).await {
+            let outcome = self.cycle(&cancel, &mut steady_since, after_failure).await;
+            after_failure = matches!(outcome, Err(SupervisorError::Provider(_)));
+            match outcome {
                 Ok(()) => {
                     // Graceful stream end (compaction or server-initiated
                     // close). Reset backoff, but still yield a short
@@ -1847,6 +1891,7 @@ impl<P: ConfigProvider> Supervisor<P> {
         &self,
         cancel: &tokio::sync::watch::Receiver<bool>,
         steady_since: &mut Option<tokio::time::Instant>,
+        after_failure: bool,
     ) -> Result<(), SupervisorError> {
         *steady_since = None;
         let load = tokio::select! {
@@ -1864,8 +1909,16 @@ impl<P: ConfigProvider> Supervisor<P> {
             self.apply_resync_at(&load.entries, Some(revision));
             self.record_read_revision(revision);
         });
+        self.status.record_prefix_reads(
+            self.sources
+                .iter()
+                .zip(&load.revisions)
+                .filter_map(|(source, rev)| rev.map(|rev| (source.prefix.prefix.clone(), rev))),
+        );
 
         let mut streams = Vec::with_capacity(self.sources.len());
+        let mut opened = Vec::with_capacity(self.sources.len());
+        let mut watching = Vec::with_capacity(self.sources.len());
         for (source, from) in self.sources.iter().zip(&load.revisions) {
             // Each prefix resumes from its own read, never from the
             // maximum across prefixes. A prefix whose read was refused
@@ -1877,7 +1930,11 @@ impl<P: ConfigProvider> Supervisor<P> {
                 watch = source.provider.watch(from + 1) => watch,
             };
             match watch {
-                Ok(stream) => streams.push(stream),
+                Ok(stream) => {
+                    opened.push((&source.prefix.prefix, from + 1));
+                    watching.push(source.prefix.clone());
+                    streams.push((&source.prefix.prefix, stream));
+                }
                 Err(err) if source.tolerates(&err) => {
                     // No stream for this prefix this cycle. It is retried
                     // whenever the cycle restarts — which is what a
@@ -1888,11 +1945,56 @@ impl<P: ConfigProvider> Supervisor<P> {
                 Err(err) => return Err(SupervisorError::Provider(err)),
             }
         }
+        if after_failure {
+            for (prefix, start_revision) in opened {
+                tracing::info!(
+                    prefix = %prefix,
+                    start_revision,
+                    "etcd watch established after a failed cycle",
+                );
+            }
+        }
+        // Which stream applies a key. With no `env_id` the environment
+        // prefix is the bare base and `<base>/global/` nests inside it, so
+        // both watches deliver every catalog event, and `select_all` keeps
+        // no order across them: applying both copies lets a late one undo
+        // a newer write — an older price comes back, a deleted one
+        // reappears. Only the stream of the longest watched prefix
+        // containing the key applies it, so each key follows one stream's
+        // revision order; the read above took the same key from the same
+        // prefix, so what the skipped copies replay is already in it.
+        // Resolved against the prefixes watched THIS cycle: with the
+        // catalog's watch refused, the base stream is the only one
+        // carrying those keys and keeps applying them — except what the
+        // catalog's own read already covers, which the base replays from
+        // its older read revision and would briefly roll back.
+        let owners = PrefixSet::new(watching);
+        let read_owners = PrefixSet::new(
+            self.sources
+                .iter()
+                .zip(&load.revisions)
+                .filter(|(_, rev)| rev.is_some())
+                .map(|(source, _)| source.prefix.clone())
+                .collect(),
+        );
+        let read_revision = |prefix: &str| {
+            self.sources
+                .iter()
+                .zip(&load.revisions)
+                .find(|(source, _)| source.prefix.prefix == prefix)
+                .and_then(|(_, rev)| *rev)
+        };
+        let covered_by_read = |prefix: &str, key: &str, revision: i64| {
+            read_owners.owner(key).is_some_and(|owner| {
+                owner.prefix != prefix
+                    && read_revision(&owner.prefix).is_some_and(|read| revision <= read)
+            })
+        };
         *steady_since = Some(tokio::time::Instant::now());
         // Each stream is tagged so its END is delivered as an item
         // rather than absorbed by `select_all`. See [`Watched`].
-        let mut stream = futures::stream::select_all(streams.into_iter().map(|s| {
-            s.map(Watched::Event)
+        let mut stream = futures::stream::select_all(streams.into_iter().map(|(prefix, s)| {
+            s.map(move |item| Watched::Event(prefix, item))
                 .chain(futures::stream::iter([Watched::Ended]))
         }));
 
@@ -1900,7 +2002,7 @@ impl<P: ConfigProvider> Supervisor<P> {
         // add to its batch (a resync, a stream error, the end of the
         // stream). Held here so the next loop iteration handles it
         // exactly as if it had just arrived.
-        let mut pushed_back: Option<Option<Watched>> = None;
+        let mut pushed_back: Option<Option<Watched<'_>>> = None;
         let mut apply_timing = ApplyTiming::default();
 
         loop {
@@ -1923,27 +2025,29 @@ impl<P: ConfigProvider> Supervisor<P> {
                 // either way this cycle is over and the next one re-reads
                 // and re-watches every prefix.
                 None | Some(Watched::Ended) => return Ok(()),
-                Some(Watched::Event(Err(ProviderError::Compacted))) => {
+                Some(Watched::Event(_, Err(ProviderError::Compacted))) => {
                     tracing::warn!("etcd compaction detected — resyncing");
                     // Break out so `run` re-enters `cycle` cleanly; the
                     // next iteration re-loads from scratch. We don't want
                     // to treat compaction as a backoff-worthy failure.
                     return Ok(());
                 }
-                Some(Watched::Event(Err(err))) => return Err(SupervisorError::Provider(err)),
-                Some(Watched::Event(Ok(WatchEvent::Resync { entries, revision }))) => {
+                Some(Watched::Event(_, Err(err))) => return Err(SupervisorError::Provider(err)),
+                Some(Watched::Event(prefix, Ok(WatchEvent::Resync { entries, revision }))) => {
                     config_work(self.apply_observer(), "full", entries.len(), || {
                         self.apply_resync_at(&entries, Some(revision));
                         // The resync header remains the consistent-as-of point.
                         self.record_read_revision(revision);
                     });
+                    self.status.record_prefix_event(prefix, revision);
                 }
                 // Explicit over the two batchable variants rather than a
                 // catch-all: a new `WatchEvent` must fail to compile here
                 // instead of falling into a batch that cannot carry it.
-                Some(Watched::Event(Ok(
-                    first @ (WatchEvent::Put(_) | WatchEvent::Delete { .. }),
-                ))) => {
+                Some(Watched::Event(
+                    first_prefix,
+                    Ok(first @ (WatchEvent::Put(_) | WatchEvent::Delete { .. })),
+                )) => {
                     // Coalesce: hold the batch open for a short bounded
                     // window and apply the whole run as one
                     // copy-on-write cycle. The window closes on the first
@@ -1956,7 +2060,7 @@ impl<P: ConfigProvider> Supervisor<P> {
                     // buffered made that number depend on how the etcd
                     // endpoint happened to batch its watch deliveries and
                     // on how long the previous apply took.
-                    let mut batch = vec![first];
+                    let mut batch = vec![(first_prefix, first)];
                     let quiet_period = apply_timing.quiet_period();
                     let deadline = tokio::time::Instant::now() + COALESCE_MAX_WAIT;
                     while batch.len() < MAX_APPLY_BATCH {
@@ -1993,9 +2097,10 @@ impl<P: ConfigProvider> Supervisor<P> {
                             _ = tokio::time::sleep(quiet_period) => break,
                         };
                         match item {
-                            Some(Watched::Event(Ok(
-                                event @ (WatchEvent::Put(_) | WatchEvent::Delete { .. }),
-                            ))) => batch.push(event),
+                            Some(Watched::Event(
+                                prefix,
+                                Ok(event @ (WatchEvent::Put(_) | WatchEvent::Delete { .. })),
+                            )) => batch.push((prefix, event)),
                             other => {
                                 pushed_back = Some(other);
                                 break;
@@ -2010,32 +2115,55 @@ impl<P: ConfigProvider> Supervisor<P> {
                     }
                     let staged: Vec<PendingEvent<'_>> = batch
                         .iter()
-                        .map(|event| match event {
-                            WatchEvent::Put(raw) => PendingEvent::Put(raw),
-                            // Advance the applied-revision floor to the
-                            // delete's mod_revision even when the key
-                            // wasn't present — "processed everything up
-                            // to rev X" must cover deletes, otherwise the
-                            // heartbeat-reported applied_revision (#519
-                            // B.3) stalls after a CP delete until the next
-                            // put arrives.
-                            WatchEvent::Delete { key, revision } => PendingEvent::Delete {
-                                key,
-                                revision: Some(*revision),
-                            },
-                            // Unreachable by the arm above and the drain's
-                            // own filter, both of which are exhaustive over
-                            // `WatchEvent`.
-                            WatchEvent::Resync { .. } => {
-                                unreachable!("a resync is never added to a coalesced batch")
-                            }
+                        .filter_map(|(prefix, event)| {
+                            let (key, revision, pending) = match event {
+                                WatchEvent::Put(raw) => {
+                                    (&raw.key, raw.revision, PendingEvent::Put(raw))
+                                }
+                                // Advance the applied-revision floor to the
+                                // delete's mod_revision even when the key
+                                // wasn't present — "processed everything up
+                                // to rev X" must cover deletes, otherwise the
+                                // heartbeat-reported applied_revision (#519
+                                // B.3) stalls after a CP delete until the next
+                                // put arrives.
+                                WatchEvent::Delete { key, revision } => (
+                                    key,
+                                    *revision,
+                                    PendingEvent::Delete {
+                                        key,
+                                        revision: Some(*revision),
+                                    },
+                                ),
+                                // Unreachable by the arm above and the drain's
+                                // own filter, both of which are exhaustive over
+                                // `WatchEvent`.
+                                WatchEvent::Resync { .. } => {
+                                    unreachable!("a resync is never added to a coalesced batch")
+                                }
+                            };
+                            (owners.owns(prefix, key) && !covered_by_read(prefix, key, revision))
+                                .then_some(pending)
                         })
                         .collect();
-                    let (_, elapsed) =
-                        config_work(self.apply_observer(), "watch", staged.len(), || {
-                            self.apply_events(&staged)
-                        });
-                    apply_timing.record(elapsed);
+                    if !staged.is_empty() {
+                        let (_, elapsed) =
+                            config_work(self.apply_observer(), "watch", staged.len(), || {
+                                self.apply_events(&staged)
+                            });
+                        apply_timing.record(elapsed);
+                    }
+                    // Every event in the batch is processed, whatever its
+                    // outcome — including a rejected or unknown-kind one,
+                    // and one left to the stream that owns its key.
+                    for (prefix, event) in &batch {
+                        let revision = match event {
+                            WatchEvent::Put(raw) => raw.revision,
+                            WatchEvent::Delete { revision, .. } => *revision,
+                            WatchEvent::Resync { revision, .. } => *revision,
+                        };
+                        self.status.record_prefix_event(prefix, revision);
+                    }
                 }
             }
         }
@@ -2152,8 +2280,9 @@ impl PrefixLoad {
 /// survivor while the ended prefix's configuration froze for the life
 /// of the process — no resync, no error, and `/status/config` still
 /// reporting connected.
-enum Watched {
-    Event(Result<WatchEvent, ProviderError>),
+enum Watched<'a> {
+    /// An item from the watch on this prefix.
+    Event(&'a str, Result<WatchEvent, ProviderError>),
     /// The stream this item came from has ended.
     Ended,
 }
@@ -2399,6 +2528,7 @@ fn merge_snapshot(dst: &AisixSnapshot, src: &AisixSnapshot) {
         users,
         budgets,
         budget_policy,
+        usage_accounting,
     } = src;
     for e in models.entries() {
         dst.models.insert_arc(e);
@@ -2463,6 +2593,9 @@ fn merge_snapshot(dst: &AisixSnapshot, src: &AisixSnapshot) {
     for e in budget_policy.entries() {
         dst.budget_policy.insert_arc(e);
     }
+    for e in usage_accounting.entries() {
+        dst.usage_accounting.insert_arc(e);
+    }
 }
 
 /// Remove `(kind, id)` from `snap`.
@@ -2494,6 +2627,7 @@ fn remove_from_snapshot(snap: &AisixSnapshot, kind: &str, id: &str) {
         users,
         budgets,
         budget_policy,
+        usage_accounting,
     } = snap;
     match kind {
         "models" => {
@@ -2561,6 +2695,9 @@ fn remove_from_snapshot(snap: &AisixSnapshot, kind: &str, id: &str) {
         }
         "budget_policy" => {
             budget_policy.remove(id);
+        }
+        "usage_accounting" => {
+            usage_accounting.remove(id);
         }
         _ => {}
     }
@@ -2640,6 +2777,7 @@ fn snapshot_has(snap: &AisixSnapshot, kind: &str, id: &str) -> bool {
         users,
         budgets,
         budget_policy,
+        usage_accounting,
     } = snap;
     match kind {
         "models" => models.get_by_id(id).is_some(),
@@ -2663,6 +2801,7 @@ fn snapshot_has(snap: &AisixSnapshot, kind: &str, id: &str) -> bool {
         "users" => users.get_by_id(id).is_some(),
         "budgets" => budgets.get_by_id(id).is_some(),
         "budget_policy" => budget_policy.get_by_id(id).is_some(),
+        "usage_accounting" => usage_accounting.get_by_id(id).is_some(),
         _ => false,
     }
 }
@@ -2705,6 +2844,7 @@ fn resource_counts(snap: &AisixSnapshot) -> BTreeMap<String, usize> {
         ("users", snap.users.len()),
         ("budgets", snap.budgets.len()),
         ("budget_policy", snap.budget_policy.len()),
+        ("usage_accounting", snap.usage_accounting.len()),
     ] {
         if n > 0 {
             counts.insert(kind.to_string(), n);
@@ -2729,6 +2869,8 @@ mod tests {
         entries: Mutex<Vec<RawEntry>>,
         revision: i64,
         events: Mutex<Vec<Result<WatchEvent, ProviderError>>>,
+        /// Keep the stream open after its events, as a quiet prefix does.
+        stays_open: bool,
     }
 
     impl FakeProvider {
@@ -2737,6 +2879,7 @@ mod tests {
                 entries: Mutex::new(entries),
                 revision,
                 events: Mutex::new(Vec::new()),
+                stays_open: false,
             }
         }
 
@@ -2760,6 +2903,9 @@ mod tests {
             ProviderError,
         > {
             let events: Vec<_> = self.events.lock().unwrap().drain(..).collect();
+            if self.stays_open {
+                return Ok(Box::new(stream::iter(events).chain(stream::pending())));
+            }
             Ok(Box::new(stream::iter(events)))
         }
     }
@@ -3287,8 +3433,7 @@ mod tests {
         // are the only thing that can produce the expected value: the
         // resync raises the floor to the highest entry revision first,
         // and entries at 5 / 7 / 42 / 99 would supply the answer by
-        // themselves — which is how the first version of this case
-        // stayed green against a last-prefix-wins mutation.
+        // themselves.
         let global_ahead = scoped_supervisor(
             ScopedProvider::serving(vec![entry("/aisix/env-1/models/m-1", VALID_MODEL, 1)], 7),
             ScopedProvider::serving(vec![entry("/aisix/global/pricing/g", VALID_PRICE, 1)], 42),
@@ -3353,7 +3498,7 @@ mod tests {
         const OTHER_PRICE: &[u8] =
             br#"{"key":"openai/gpt-4o","input_per_1k":0.001,"output_per_1k":0.002}"#;
         let sup = scoped_supervisor(
-            ScopedProvider::serving(vec![entry("/aisix/env-1/models/m-1", VALID_MODEL, 1)], 5),
+            ScopedProvider::serving(vec![entry("/aisix/env-1/models/m-1", VALID_MODEL, 1)], 10),
             ScopedProvider::scripted(vec![
                 Some((vec![entry("/aisix/global/pricing/g-1", VALID_PRICE, 3)], 3)),
                 None,
@@ -3483,7 +3628,8 @@ mod tests {
         );
         let (_tx, rx) = tokio::sync::watch::channel(false);
 
-        let cycle = tokio::time::timeout(Duration::from_secs(5), sup.cycle(&rx, &mut None)).await;
+        let cycle =
+            tokio::time::timeout(Duration::from_secs(5), sup.cycle(&rx, &mut None, false)).await;
         assert!(
             matches!(cycle, Ok(Ok(()))),
             "the environment watch ended, so the cycle must return and let \
@@ -3496,32 +3642,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn each_prefix_resumes_from_its_own_read() {
-        // The range reads run in sequence, so the later prefix reports a
-        // higher revision. Resuming BOTH watches from the maximum would
-        // skip every write to the earlier prefix made in between: absent
-        // from its read, and before the point its watch begins. The
-        // window is one range read wide and the loss is silent until the
-        // next resync.
+    async fn each_prefix_is_read_unpinned_and_resumes_from_its_own_read() {
+        // A later prefix is read at "now", never at an earlier prefix's
+        // revision: a server can refuse a revision it has not caught up
+        // to yet as a future one (kine does, for an empty range). So each
+        // prefix's watch starts after its OWN read, and the revision it
+        // reports is its own. Resuming the earlier prefix from the later
+        // read would skip every write to it in between; resuming the
+        // later one from the earlier read would replay rows it already
+        // holds and report less than it has.
         let env =
             ScopedProvider::serving(vec![entry("/aisix/env-1/models/m-1", VALID_MODEL, 1)], 7);
-        let global =
-            ScopedProvider::serving(vec![entry("/aisix/global/pricing/g", VALID_PRICE, 1)], 42);
+        let global = ScopedProvider::serving(
+            vec![
+                entry("/aisix/global/pricing/g", VALID_PRICE, 1),
+                entry("/aisix/global/pricing/late", VALID_PRICE, 20),
+            ],
+            42,
+        );
         let sup = scoped_supervisor(Arc::clone(&env), Arc::clone(&global));
 
         let (_tx, rx) = tokio::sync::watch::channel(false);
-        sup.cycle(&rx, &mut None).await.expect("cycle completes");
+        sup.cycle(&rx, &mut None, false)
+            .await
+            .expect("cycle completes");
 
-        assert_eq!(
-            *env.watched_from.lock().unwrap(),
-            Some(8),
-            "the environment watch must resume from its OWN read (7), not from the maximum (42)",
-        );
+        assert_eq!(*env.watched_from.lock().unwrap(), Some(8));
         assert_eq!(*global.watched_from.lock().unwrap(), Some(43));
-        // The reported applied revision is the MINIMUM, for the same
-        // reason the resume points differ: the union is only consistent
-        // as far as the earliest read (`applied_revision_is_the_minimum_
-        // across_prefixes`).
+        assert_eq!(
+            sup.handle().load().global_pricing.len(),
+            2,
+            "the catalog's own read takes in the row written after the environment was read",
+        );
+        let revisions = sup.watch_status().prefix_revisions();
+        assert_eq!(revisions.get("/aisix/env-1/"), Some(&7));
+        assert_eq!(revisions.get("/aisix/global/"), Some(&42));
+        // The union as a whole is still only as fresh as its earliest read.
         assert_eq!(sup.watch_status().snapshot().revision, 7);
     }
 
@@ -3538,7 +3694,7 @@ mod tests {
         // The environment stream is empty, so the cycle drains it and
         // returns Ok — a refusal on the catalog would have surfaced here
         // as SupervisorError::Provider.
-        sup.cycle(&rx, &mut None)
+        sup.cycle(&rx, &mut None, false)
             .await
             .expect("cycle survives the refusal");
         assert_eq!(sup.handle().load().models.len(), 1);
@@ -3770,7 +3926,7 @@ mod tests {
 
         let (_tx, rx) = tokio::sync::watch::channel(false);
         // One cycle: load_all, then drain the whole prepared stream.
-        let _ = sup.cycle(&rx, &mut None).await;
+        let _ = sup.cycle(&rx, &mut None, false).await;
 
         let snap = sup.handle().load();
         assert_eq!(snap.models.len(), 6);
@@ -3814,7 +3970,7 @@ mod tests {
         let provider = Arc::new(FakeProvider::new(vec![], 0).with_events(events));
         let sup = Arc::new(Supervisor::new(provider, "/aisix"));
         let (_tx, rx) = tokio::sync::watch::channel(false);
-        let _ = sup.cycle(&rx, &mut None).await;
+        let _ = sup.cycle(&rx, &mut None, false).await;
 
         let snap = sup.handle().load();
         assert_eq!(snap.models.len(), 1, "the put after the delete survived");
@@ -3966,7 +4122,7 @@ mod tests {
         let provider = Arc::new(FakeProvider::new(vec![], 0).with_events(events));
         let sup = Arc::new(Supervisor::new(provider, "/aisix"));
         let (_tx, rx) = tokio::sync::watch::channel(false);
-        let _ = sup.cycle(&rx, &mut None).await;
+        let _ = sup.cycle(&rx, &mut None, false).await;
 
         let snap = sup.handle().load();
         assert_eq!(snap.models.len(), 1, "the pinned last known good serves");
@@ -3987,6 +4143,16 @@ mod tests {
         entries: Vec<RawEntry>,
         revision: i64,
         rx: Mutex<Option<futures::channel::mpsc::UnboundedReceiver<WatchItem>>>,
+        /// Refuse the read or the watch the way a control plane
+        /// withholding the catalog does.
+        refuse: Refuse,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Refuse {
+        Nothing,
+        Read,
+        Watch,
     }
 
     type WatchItem = Result<WatchEvent, ProviderError>;
@@ -3998,21 +4164,103 @@ mod tests {
             Arc<Self>,
             futures::channel::mpsc::UnboundedSender<WatchItem>,
         ) {
+            Self::holding(Vec::new(), revision)
+        }
+
+        /// Serves `entries` from a read consistent as of `revision`.
+        fn holding(
+            entries: Vec<RawEntry>,
+            revision: i64,
+        ) -> (
+            Arc<Self>,
+            futures::channel::mpsc::UnboundedSender<WatchItem>,
+        ) {
             let (tx, rx) = futures::channel::mpsc::unbounded();
             (
                 Arc::new(Self {
-                    entries: Vec::new(),
+                    entries,
                     revision,
                     rx: Mutex::new(Some(rx)),
+                    refuse: Refuse::Nothing,
                 }),
                 tx,
             )
         }
+
+        fn refusing(refuse: Refuse, entries: Vec<RawEntry>, revision: i64) -> Arc<Self> {
+            Arc::new(Self {
+                entries,
+                revision,
+                rx: Mutex::new(None),
+                refuse,
+            })
+        }
+    }
+
+    /// Wait for `done`, bounded: virtual time auto-advances, so an
+    /// unbounded wait would hang instead of failing.
+    async fn until(what: &str, done: impl Fn() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "never happened: {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// Runs one watch cycle over the bare base and the catalog nested in it
+    /// — the shape a gateway with no `env_id` has.
+    fn nested_cycle(
+        base: Arc<LiveProvider>,
+        catalog: Arc<LiveProvider>,
+    ) -> (Arc<Supervisor<LiveProvider>>, tokio::task::JoinHandle<()>) {
+        let sup = Arc::new(Supervisor::with_sources(
+            vec![
+                (WatchedPrefix::environment("/aisix"), base),
+                (WatchedPrefix::global("/aisix/global/"), catalog),
+            ],
+            SnapshotCache::disabled(),
+        ));
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let watcher = tokio::spawn({
+            let sup = sup.clone();
+            async move {
+                let _cancel_tx = cancel_tx;
+                sup.cycle(&cancel_rx, &mut None, false)
+                    .await
+                    .expect("the watch cycle failed");
+            }
+        });
+        (sup, watcher)
+    }
+
+    fn processed(sup: &Arc<Supervisor<LiveProvider>>, prefix: &str, rev: i64) -> impl Fn() -> bool {
+        let sup = sup.clone();
+        let prefix = prefix.to_string();
+        move || sup.watch_status().prefix_revisions().get(&prefix).copied() >= Some(rev)
+    }
+
+    fn catalog_price(sup: &Supervisor<LiveProvider>, id: &str) -> Option<(i64, f64)> {
+        sup.handle()
+            .load()
+            .global_pricing
+            .get_by_id(id)
+            .map(|e| (e.revision, e.value.input_per_1k))
+    }
+
+    fn price(input: f64) -> Vec<u8> {
+        format!(r#"{{"key":"openai/gpt-4o","input_per_1k":{input},"output_per_1k":0.015}}"#)
+            .into_bytes()
     }
 
     #[async_trait]
     impl ConfigProvider for LiveProvider {
         async fn load_all(&self) -> Result<(Vec<RawEntry>, i64), ProviderError> {
+            if self.refuse == Refuse::Read {
+                return Err(ProviderError::Rejected("permission denied".into()));
+            }
             Ok((self.entries.clone(), self.revision))
         }
 
@@ -4023,6 +4271,9 @@ mod tests {
             Box<dyn futures::Stream<Item = Result<WatchEvent, ProviderError>> + Send + Unpin>,
             ProviderError,
         > {
+            if self.refuse == Refuse::Watch {
+                return Err(ProviderError::Rejected("permission denied".into()));
+            }
             Ok(Box::new(
                 self.rx.lock().unwrap().take().expect("watched twice"),
             ))
@@ -4071,7 +4322,7 @@ mod tests {
         let watcher = tokio::spawn({
             let sup = sup.clone();
             async move {
-                let _ = sup.cycle(&cancel_rx, &mut None).await;
+                let _ = sup.cycle(&cancel_rx, &mut None, false).await;
             }
         });
 
@@ -4138,7 +4389,7 @@ mod tests {
         let watcher = tokio::spawn({
             let sup = sup.clone();
             async move {
-                let _ = sup.cycle(&cancel_rx, &mut None).await;
+                let _ = sup.cycle(&cancel_rx, &mut None, false).await;
             }
         });
 
@@ -4185,6 +4436,203 @@ mod tests {
         watcher.await.unwrap();
     }
 
+    /// With no `env_id` the environment prefix is the bare base, so the
+    /// catalog's watch and the base's both deliver every `<base>/global/`
+    /// event, with no order between the two streams. A copy arriving late
+    /// on the base stream must not undo what the catalog stream already
+    /// applied: neither an older price nor a put that precedes a delete.
+    #[tokio::test(start_paused = true)]
+    async fn a_catalog_event_late_on_the_base_stream_does_not_undo_a_newer_one() {
+        const KEY: &str = "/aisix/global/pricing/p-1";
+        // The base is read first, so its read is the older one.
+        let (base, base_tx) = LiveProvider::new(7);
+        let (catalog, catalog_tx) = LiveProvider::new(9);
+        let (sup, watcher) = nested_cycle(base, catalog);
+        until("initial load", processed(&sup, "/aisix/global/", 9)).await;
+
+        // The catalog stream runs ahead: two writes to the same price.
+        for (rev, input) in [(10, 0.001), (11, 0.002)] {
+            catalog_tx
+                .unbounded_send(Ok(WatchEvent::Put(entry(KEY, &price(input), rev))))
+                .unwrap();
+        }
+        until(
+            "catalog stream at 11",
+            processed(&sup, "/aisix/global/", 11),
+        )
+        .await;
+        assert_eq!(catalog_price(&sup, "p-1"), Some((11, 0.002)));
+
+        // The base stream's copy of the OLDER write arrives afterwards.
+        base_tx
+            .unbounded_send(Ok(WatchEvent::Put(entry(KEY, &price(0.001), 10))))
+            .unwrap();
+        until("base stream at 10", processed(&sup, "/aisix", 10)).await;
+        assert_eq!(
+            catalog_price(&sup, "p-1"),
+            Some((11, 0.002)),
+            "a late copy on the base stream regressed the price",
+        );
+
+        // The catalog deletes the price; the base stream's copy of the put
+        // before it arrives after the delete.
+        catalog_tx
+            .unbounded_send(Ok(WatchEvent::Delete {
+                key: KEY.into(),
+                revision: 12,
+            }))
+            .unwrap();
+        until(
+            "catalog stream at 12",
+            processed(&sup, "/aisix/global/", 12),
+        )
+        .await;
+        assert_eq!(catalog_price(&sup, "p-1"), None);
+        base_tx
+            .unbounded_send(Ok(WatchEvent::Put(entry(KEY, &price(0.002), 11))))
+            .unwrap();
+        until("base stream at 11", processed(&sup, "/aisix", 11)).await;
+        assert_eq!(
+            catalog_price(&sup, "p-1"),
+            None,
+            "a deleted price came back"
+        );
+
+        // The base stream still applies the keys it owns, and a skipped
+        // copy still counts as processed for it.
+        base_tx
+            .unbounded_send(Ok(WatchEvent::Delete {
+                key: KEY.into(),
+                revision: 12,
+            }))
+            .unwrap();
+        base_tx
+            .unbounded_send(Ok(WatchEvent::Put(entry(
+                "/aisix/models/m-1",
+                VALID_MODEL,
+                13,
+            ))))
+            .unwrap();
+        until("base stream at 13", processed(&sup, "/aisix", 13)).await;
+        assert_eq!(sup.handle().load().models.len(), 1);
+        assert_eq!(catalog_price(&sup, "p-1"), None);
+
+        drop(base_tx);
+        drop(catalog_tx);
+        watcher.await.unwrap();
+    }
+
+    /// The prefixes are read in sequence, base first, so a catalog row
+    /// deleted between the two reads is still in the base's read. The
+    /// catalog's read is the one that answers for its keys: the delete is
+    /// already behind the catalog stream's start, and the base stream's
+    /// replay of it is left to that stream, so serving the base's copy
+    /// would keep a deleted price for the whole cycle.
+    #[tokio::test(start_paused = true)]
+    async fn a_catalog_delete_between_the_two_reads_is_not_served() {
+        const KEY: &str = "/aisix/global/pricing/p-1";
+        let (base, base_tx) = LiveProvider::holding(
+            vec![
+                entry("/aisix/models/m-1", VALID_MODEL, 3),
+                entry(KEY, &price(0.001), 12),
+            ],
+            15,
+        );
+        // Deleted at 17, read at 20.
+        let (catalog, catalog_tx) = LiveProvider::holding(Vec::new(), 20);
+        let (sup, watcher) = nested_cycle(base, catalog);
+        until("initial load", processed(&sup, "/aisix/global/", 20)).await;
+        assert_eq!(
+            catalog_price(&sup, "p-1"),
+            None,
+            "the deleted price was loaded"
+        );
+        assert_eq!(sup.handle().load().models.len(), 1);
+
+        // The base stream replays the delete from its own read on.
+        base_tx
+            .unbounded_send(Ok(WatchEvent::Delete {
+                key: KEY.into(),
+                revision: 17,
+            }))
+            .unwrap();
+        until("base stream at 17", processed(&sup, "/aisix", 17)).await;
+        assert_eq!(catalog_price(&sup, "p-1"), None);
+
+        drop(base_tx);
+        drop(catalog_tx);
+        watcher.await.unwrap();
+    }
+
+    /// The base stream's copy of a catalog event is skipped only while the
+    /// catalog has a watch of its own. With its read or its watch refused,
+    /// the base stream is the only one carrying the catalog's keys.
+    #[tokio::test(start_paused = true)]
+    async fn with_the_catalog_refused_the_base_stream_still_applies_its_keys() {
+        for refuse in [Refuse::Read, Refuse::Watch] {
+            let (base, base_tx) = LiveProvider::new(9);
+            let catalog = LiveProvider::refusing(
+                refuse,
+                vec![entry("/aisix/global/pricing/p-1", &price(0.001), 5)],
+                9,
+            );
+            let (sup, watcher) = nested_cycle(base, catalog);
+            until("initial load", processed(&sup, "/aisix", 9)).await;
+
+            base_tx
+                .unbounded_send(Ok(WatchEvent::Put(entry(
+                    "/aisix/global/pricing/p-1",
+                    &price(0.002),
+                    10,
+                ))))
+                .unwrap();
+            until("base stream at 10", processed(&sup, "/aisix", 10)).await;
+            assert_eq!(
+                catalog_price(&sup, "p-1"),
+                Some((10, 0.002)),
+                "refused {refuse:?}",
+            );
+
+            drop(base_tx);
+            watcher.await.unwrap();
+        }
+    }
+
+    /// With the catalog's read served and only its watch refused, the base
+    /// stream carries the catalog's keys but replays them from its own,
+    /// older read. What the catalog's read already holds must not be
+    /// rolled back by that replay.
+    #[tokio::test(start_paused = true)]
+    async fn a_base_replay_below_the_catalog_read_does_not_roll_it_back() {
+        const KEY: &str = "/aisix/global/pricing/p-1";
+        let (base, base_tx) = LiveProvider::new(5);
+        let catalog = LiveProvider::refusing(Refuse::Watch, vec![entry(KEY, &price(0.002), 8)], 9);
+        let (sup, watcher) = nested_cycle(base, catalog);
+        until("initial load", processed(&sup, "/aisix", 5)).await;
+        assert_eq!(catalog_price(&sup, "p-1"), Some((8, 0.002)));
+
+        for (rev, input) in [(7, 0.001), (8, 0.002)] {
+            base_tx
+                .unbounded_send(Ok(WatchEvent::Put(entry(KEY, &price(input), rev))))
+                .unwrap();
+            until("base replay", processed(&sup, "/aisix", rev)).await;
+            assert_eq!(
+                catalog_price(&sup, "p-1"),
+                Some((8, 0.002)),
+                "the replay at {rev} rolled the catalog's read back",
+            );
+        }
+
+        base_tx
+            .unbounded_send(Ok(WatchEvent::Put(entry(KEY, &price(0.003), 10))))
+            .unwrap();
+        until("base stream at 10", processed(&sup, "/aisix", 10)).await;
+        assert_eq!(catalog_price(&sup, "p-1"), Some((10, 0.003)));
+
+        drop(base_tx);
+        watcher.await.unwrap();
+    }
+
     /// Shutdown must not throw away what the window already took off the
     /// stream. Those events are gone from the watch, so the apply that
     /// follows the cancelled window is the only thing that can still put
@@ -4199,7 +4647,7 @@ mod tests {
 
         let watcher = tokio::spawn({
             let sup = sup.clone();
-            async move { sup.cycle(&cancel_rx, &mut None).await }
+            async move { sup.cycle(&cancel_rx, &mut None, false).await }
         });
         let load_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while sup.handle().version() == 0 {
@@ -4252,7 +4700,7 @@ mod tests {
 
         let watcher = tokio::spawn({
             let sup = sup.clone();
-            async move { sup.cycle(&cancel_rx, &mut None).await }
+            async move { sup.cycle(&cancel_rx, &mut None, false).await }
         });
         let load_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while sup.handle().version() == 0 {
@@ -4428,7 +4876,7 @@ mod tests {
     async fn apply_put_propagates_every_resource_kind() {
         const VALID_PROVIDER_KEY: &[u8] = br#"{
             "display_name": "watch-pk",
-            "secret": "sk-watch"
+            "api_key": "sk-watch"
         }"#;
         const VALID_GUARDRAIL: &[u8] = br#"{
             "name": "watch-block",
@@ -4552,7 +5000,7 @@ mod tests {
             vec![
                 entry(
                     "/aisix/provider_keys/pk-1",
-                    br#"{"display_name":"x","secret":"y"}"#,
+                    br#"{"display_name":"x","api_key":"y"}"#,
                     1,
                 ),
                 // #826: a watch delete for a guardrail attachment must
@@ -5128,6 +5576,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn per_prefix_revisions_cover_every_processed_event_and_only_their_own_stream() {
+        // Each prefix's reported revision means every event under it at or
+        // below the value has been processed. A rejected write and one of a
+        // kind this build does not know are processed too. And one prefix's
+        // events never move another's value: the two streams are not
+        // ordered against each other, so the catalog stream may still owe
+        // an event below the environment's latest.
+        let env = Arc::new(FakeProvider::new(vec![], 7).with_events(vec![
+            Ok(WatchEvent::Put(entry(
+                "/aisix/env/models/broken",
+                b"{not json",
+                12,
+            ))),
+            Ok(WatchEvent::Put(entry(
+                "/aisix/env/no_such_kind/x",
+                b"{}",
+                15,
+            ))),
+        ]));
+        let global = Arc::new(FakeProvider {
+            stays_open: true,
+            ..FakeProvider::new(vec![], 7)
+        });
+        let sup = Arc::new(Supervisor::with_sources(
+            vec![
+                (WatchedPrefix::environment("/aisix/env/"), env),
+                (WatchedPrefix::global("/aisix/global/"), global),
+            ],
+            SnapshotCache::disabled(),
+        ));
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        // The environment stream ends after its events, which ends the cycle.
+        let _ = tokio::time::timeout(Duration::from_secs(5), sup.cycle(&rx, &mut None, false))
+            .await
+            .expect("the cycle ends with the environment stream");
+
+        let revisions = sup.watch_status().prefix_revisions();
+        assert_eq!(revisions.get("/aisix/env/"), Some(&15));
+        assert_eq!(revisions.get("/aisix/global/"), Some(&7));
+    }
+
+    #[tokio::test]
+    async fn a_restored_cache_reports_no_prefix_revisions() {
+        // Only a live read knows what each prefix is complete to.
+        let sup = Supervisor::new(Arc::new(FakeProvider::new(vec![], 7)), "/aisix");
+        assert!(sup.watch_status().prefix_revisions().is_empty());
+    }
+
+    #[tokio::test]
     async fn watch_status_age_grows_when_no_events_arrive() {
         // Pin the freshness signal: after an apply, the age is small;
         // wait briefly and observe it has grown. This is what the
@@ -5452,6 +5949,54 @@ mod tests {
         );
         // The served row keeps counting.
         assert_eq!(view["applied"]["resource_counts"]["models"], 1);
+    }
+
+    #[tokio::test]
+    async fn budget_policy_watch_put_rejects_invalid_timezone_and_keeps_last_good() {
+        let provider = Arc::new(FakeProvider::new(vec![], 0));
+        let sup = Supervisor::new(provider, "/aisix");
+        sup.load_once().await.unwrap();
+
+        let good =
+            br#"{"fail_mode":"sticky","closed_grace_seconds":300,"timezone":"Asia/Shanghai"}"#;
+        let bad = br#"{"fail_mode":"sticky","closed_grace_seconds":300,"timezone":"Local"}"#;
+
+        assert!(sup.apply_put(&entry("/aisix/budget_policy/env-1", good, 1)));
+        assert_eq!(
+            sup.handle()
+                .load()
+                .budget_policy
+                .get_by_id("env-1")
+                .unwrap()
+                .value
+                .timezone
+                .as_deref(),
+            Some("Asia/Shanghai")
+        );
+
+        assert!(!sup.apply_put(&entry("/aisix/budget_policy/env-1", bad, 2)));
+        assert_eq!(
+            sup.handle()
+                .load()
+                .budget_policy
+                .get_by_id("env-1")
+                .unwrap()
+                .value
+                .timezone
+                .as_deref(),
+            Some("Asia/Shanghai"),
+            "rejected watch put must preserve last-known-good budget_policy"
+        );
+        let view = serde_json::to_value(sup.config_status().view()).unwrap();
+        let rejected = view["rejected"].as_array().unwrap();
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0]["resource_kind"], "budget_policy");
+        assert_eq!(rejected[0]["resource_id"], "env-1");
+        assert_eq!(rejected[0]["last_error_kind"], "schema_failed");
+        assert!(rejected[0]["last_error"]
+            .as_str()
+            .unwrap()
+            .contains("IANA timezone"));
     }
 
     #[tokio::test]

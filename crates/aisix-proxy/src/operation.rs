@@ -127,7 +127,7 @@ pub(crate) const BATCH_COMPLETION: Surface = Surface::split("batch", "batch_comp
 /// and would have to mint one to say anything here.
 pub(crate) fn surface_for_endpoint(endpoint: &str) -> Option<Surface> {
     Some(match endpoint {
-        "/v1/chat/completions" => CHAT,
+        "/v1/chat/completions" | crate::gemini::ENDPOINT | crate::gemini::STREAM_ENDPOINT => CHAT,
         "/v1/completions" => COMPLETIONS,
         "/v1/embeddings" => EMBEDDINGS,
         "/v1/images/generations" => IMAGE_GENERATION,
@@ -143,6 +143,7 @@ pub(crate) fn surface_for_endpoint(endpoint: &str) -> Option<Surface> {
         "/v1/audio/speech" => SPEECH,
         "/v1/videos" => VIDEO_GENERATION,
         "/v1/realtime" => REALTIME,
+        "/api-ws/v1/inference" => TRANSCRIPTION,
         "/v1/files" | "/v1/files/:id" => FILES,
         "/v1/batches" | "/v1/batches/:id" => BATCHES,
         "/v1/fine_tuning/jobs" | "/v1/fine_tuning/jobs/:id" => FINE_TUNING,
@@ -194,6 +195,11 @@ mod tests {
             "/v1/models",
             Emits::Nothing("catalog listing; reaches no upstream and meters nothing"),
         ),
+        ("/v1beta/models/*model_action", Emits::Usage(CHAT)),
+        (
+            "/v1beta1/projects/:project/locations/:location/publishers/google/models/*model_action",
+            Emits::Usage(CHAT),
+        ),
         ("/v1/chat/completions", Emits::Usage(CHAT)),
         ("/v1/completions", Emits::Usage(COMPLETIONS)),
         ("/v1/embeddings", Emits::Usage(EMBEDDINGS)),
@@ -218,6 +224,7 @@ mod tests {
             Emits::Nothing("downloads a job the submission already metered"),
         ),
         ("/v1/realtime", Emits::Usage(REALTIME)),
+        ("/api-ws/v1/inference", Emits::Usage(TRANSCRIPTION)),
         ("/v1/files", Emits::Usage(FILES)),
         ("/v1/files/:id", Emits::Usage(FILES)),
         ("/v1/files/:id/content", Emits::Usage(FILES)),

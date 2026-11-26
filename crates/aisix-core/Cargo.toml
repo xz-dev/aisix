@@ -10,7 +10,7 @@ description = "aisix: core types (Config, ResourceEntry, Snapshot, errors)"
 
 [dependencies]
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 arc-swap.workspace = true
 dashmap.workspace = true
 thiserror.workspace = true
@@ -42,9 +42,6 @@ url.workspace = true
 # Header-name parsing/validation for proxy.request_id.accept_headers
 # (AISIX-Cloud#1288) — same role ipnet plays for real_ip.
 http.workspace = true
-# filesource: resources.yaml parsing + deterministic UUIDv5 resource ids
-yaml-rust2.workspace = true
-uuid.workspace = true
 # `tokio::sync::watch` backs ConfigStatus::wait_until_applied — the
 # awaitable first-apply signal the boot path gates the proxy listener on.
 # Runtime-agnostic: no reactor or driver is pulled into this crate.

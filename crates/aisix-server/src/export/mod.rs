@@ -1,17 +1,17 @@
 //! `aisix export` — emit a resources file from a running etcd store.
 //!
-//! The inverse of the file source (`aisix_core::filesource`): it reads
-//! every canonical resource document under the configured prefix, decodes
-//! it through the same typed models the gateway loads, and re-emits the
-//! set as a `resources.yaml` the file source can load back — the
-//! migration / backup path for a standalone deployment moving from
-//! Admin-API-plus-etcd to the declarative file.
+//! A resources file is the set of etcd documents written down
+//! (`aisix_etcd::file_source`), so the export reads every document under
+//! the configured prefix, decodes it through the loader the gateway uses,
+//! and writes each one as its etcd id plus the document the gateway
+//! serves — the migration / backup path for a standalone deployment
+//! moving from etcd to the declarative file.
 //!
 //! Pipeline:
 //!
 //! ```text
 //! etcd range read → decode (aisix_etcd::build_snapshot, the loader path)
-//!   → resugar references + strip ids + redact secrets (document)
+//!   → id + document, redact secrets (document)
 //!   → YAML emit (yaml_emit) → stdout / -o file
 //!   → secret-placeholder list + warnings → stderr
 //! ```
@@ -78,27 +78,26 @@ pub async fn run(args: ExportArgs) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("etcd range read under {:?} failed: {e}", args.prefix))?;
 
     // Decode through the identical loader path the gateway uses, so the
-    // exported set is exactly what the running gateway would serve.
-    // The catalog prefix is declared alongside the exported one even
-    // though export never emits a pricing document. When `--prefix` is
-    // the bare base — the pre-`env_id` shape — the range read also
-    // returns `<base>/global/pricing/*`, and resolved against the base
-    // alone those keys parse as kind `global` and are reported as
-    // rejected rows the operator did nothing wrong to produce. Declaring
-    // the prefix resolves them as the prices they are; they simply have
-    // no file form to be emitted into.
+    // exported set is exactly what the running gateway would serve. With
+    // `--prefix` the bare base (no `env_id`), the range read also returns the
+    // shared catalog under `<base>/global/`; declaring it resolves those keys
+    // as the global prices they are rather than as a kind `global`. An
+    // environment prefix (`<base>/<env_id>`) does not reach the catalog, which
+    // the per-model pricing warning then reports.
     let prefixes = PrefixSet::new(vec![
         WatchedPrefix::environment(&args.prefix),
         WatchedPrefix::global(format!("{}/global/", args.prefix.trim_end_matches('/'))),
     ]);
     let (snapshot, stats) = build_snapshot(&prefixes, &entries);
+    let (raw, dropped) = document::stored_documents(&prefixes, &entries, &stats);
 
-    let document = build_export_document(&snapshot, args.reveal_secrets);
+    let document = build_export_document(&snapshot, &raw, args.reveal_secrets);
     let yaml = emit_yaml(&document).map_err(|e| anyhow::anyhow!(e))?;
 
     let resource_count = document
         .collections
         .iter()
+        .chain(&document.global_collections)
         .map(|(_, entries)| entries.len())
         .sum::<usize>();
 
@@ -117,31 +116,52 @@ pub async fn run(args: ExportArgs) -> anyhow::Result<()> {
     }
 
     report_rejections(&stats);
+    report_warnings(&dropped);
     report_warnings(&document.warnings);
     report_secrets(&document, args.reveal_secrets);
 
-    // The file is written for inspection either way, but a scripted
-    // migration must not mistake an incomplete or non-loadable export for a
-    // finished one. Report every failure class before exiting, so an operator
-    // sees the full list in one run: a row the loader rejected is silently
-    // absent from the output (the file loads, yet the migration lost a
-    // resource), and a collision or dangling reference means the file cannot
-    // be loaded back as-is.
-    if !document.blocking.is_empty() {
+    // A resources file keys every entry by a canonical UUID; etcd takes any
+    // id segment, so a hand-written store can hold one the file refuses.
+    let invalid_ids: Vec<String> = document
+        .collections
+        .iter()
+        .map(|(kind, entries)| (kind.to_string(), entries))
+        .chain(
+            document
+                .global_collections
+                .iter()
+                .map(|(kind, entries)| (format!("global.{kind}"), entries)),
+        )
+        .flat_map(|(kind, entries)| entries.iter().map(move |e| (kind.clone(), e)))
+        .filter_map(|(kind, entry)| {
+            let id = entry
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let canonical =
+                uuid::Uuid::try_parse(id).is_ok_and(|u| u.hyphenated().to_string() == id);
+            (!canonical).then(|| format!("{kind} {id:?}"))
+        })
+        .collect();
+    if !invalid_ids.is_empty() {
         eprintln!(
-            "\n{} issue(s) leave the exported file non-loadable — fix them in the source and \
-             re-export (or run `aisix validate` on the file):",
-            document.blocking.len()
+            "\n{} resource(s) are stored under an id that is not a lowercase hyphenated UUID, \
+             which a resources file does not accept — the written file will not load until they \
+             are re-keyed:",
+            invalid_ids.len()
         );
-        for issue in &document.blocking {
-            eprintln!("  - {issue}");
+        for id in &invalid_ids {
+            eprintln!("  - {id}");
         }
         anyhow::bail!(
-            "export completed with {} blocking issue(s); the resources file will not load as-is",
-            document.blocking.len()
+            "export completed with {} id(s) a resources file cannot carry",
+            invalid_ids.len()
         );
     }
 
+    // The file is written for inspection either way, but a scripted
+    // migration must not mistake an incomplete export for a finished one:
+    // a row the loader rejected is absent from the output.
     if !stats.rejections.is_empty() {
         anyhow::bail!(
             "export omitted {} rejected entr(ies); the resources file is incomplete. \
@@ -247,5 +267,9 @@ fn report_secrets(document: &document::ExportDocument, reveal_secrets: bool) {
 }
 
 fn document_has_any_entry(document: &document::ExportDocument) -> bool {
-    document.collections.iter().any(|(_, e)| !e.is_empty())
+    document
+        .collections
+        .iter()
+        .chain(&document.global_collections)
+        .any(|(_, e)| !e.is_empty())
 }

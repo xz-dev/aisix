@@ -675,7 +675,9 @@ async fn dispatch(
     } = match dispatched {
         Ok(d) => d,
         Err(e) => {
-            reservation.commit_tokens(0).await;
+            reservation
+                .commit_tokens(aisix_ratelimit::TokenCharge::NONE)
+                .await;
             return Err(e);
         }
     };
@@ -701,23 +703,64 @@ async fn dispatch(
             // input-only, so `prompt_tokens == total_tokens` on the OpenAI
             // shape. Providers that report only `total_tokens` (e.g. some
             // rerank/embed backends) get prompt from total — upstream-
-            // authoritative, not an estimate. Only when the upstream
-            // reports nothing at all does the local estimator count the
-            // request `input`. Telemetry only — the response body is
-            // forwarded untouched.
-            let (prompt_tokens, usage_estimated) =
-                if let Some(reported) = reported_prompt_tokens(&embed_resp.usage) {
-                    (reported, false)
-                } else {
-                    let upstream_model = model.upstream_model().unwrap_or("unknown");
-                    let estimated = match &req.token_input {
-                        Some(tokens) => token_id_count(tokens),
-                        None => req.input.iter().fold(0u32, |acc, s| {
-                            acc.saturating_add(crate::token_estimate::count_text(upstream_model, s))
-                        }),
-                    };
-                    (estimated, estimated > 0)
+            // authoritative, not an estimate. A reported count stands, `0`
+            // included; only when the upstream reports neither does the
+            // local estimator count the request `input`, and the client is
+            // told that estimate, as the usage record carries it.
+            let (prompt_tokens, usage_estimated) = if let Some(reported) =
+                reported_prompt_tokens(&embed_resp.usage)
+            {
+                (reported, false)
+            } else {
+                let estimated = match &req.token_input {
+                    Some(tokens) => token_id_count(tokens),
+                    None => {
+                        // Counted off the request worker unless the input is small.
+                        let upstream_model = model.upstream_model().unwrap_or("unknown").to_owned();
+                        let input = req.input.clone();
+                        // The JSON-length rule of the prompt probe: each
+                        // input with its quotes and a separator, so the
+                        // number of inputs is inside the bound too.
+                        let input_bytes = input
+                            .iter()
+                            .fold(0usize, |n, s| n.saturating_add(s.len()).saturating_add(3));
+                        crate::token_estimate::run_recorded_on_cancel(
+                            input_bytes,
+                            move || {
+                                crate::token_estimate::count_texts(
+                                    &upstream_model,
+                                    input.iter().map(String::as_str),
+                                )
+                            },
+                            |prompt_tokens| crate::token_estimate::CancelledUsage {
+                                usage: aisix_gateway::UsageStats::new(prompt_tokens, 0),
+                                usage_estimated: prompt_tokens > 0,
+                                estimated_counts: aisix_obs::EstimatedCounts {
+                                    prompt: prompt_tokens > 0,
+                                    completion: false,
+                                },
+                                answered_after_ms: None,
+                            },
+                            || {
+                                crate::token_estimate::RateCommit::new(
+                                    &state.limiter,
+                                    [Some(&reservation)],
+                                    // The estimate stands in for a usage the
+                                    // upstream reported none of, so the commit
+                                    // below is the prompt alone.
+                                    |usage| u64::from(usage.prompt_tokens),
+                                )
+                            },
+                        )
+                        .await
+                    }
                 };
+                (estimated, estimated > 0)
+            };
+            if usage_estimated {
+                embed_resp.usage.prompt_tokens = prompt_tokens;
+                embed_resp.usage.total_tokens = prompt_tokens;
+            }
             // Commit the reservation — release the concurrency permit
             // and finalise RPM. Embeddings do report prompt_tokens via
             // EmbeddingResponse.usage; thread it through so TPM works
@@ -725,8 +768,9 @@ async fn dispatch(
             // fallback above keeps this accurate for upstreams that
             // report no usage.
             reservation
-                .commit_tokens(u64::from(
-                    (embed_resp.usage.total_tokens).max(prompt_tokens),
+                .commit_tokens(aisix_ratelimit::TokenCharge::new(
+                    u64::from((embed_resp.usage.total_tokens).max(prompt_tokens)),
+                    usage_estimated,
                 ))
                 .await;
             let provider_label = provider.clone();
@@ -766,7 +810,9 @@ async fn dispatch(
             // Drop the reservation without committing — the request
             // didn't hit the upstream. The handler emits no usage unless a
             // guardrail decision was already recorded before this branch.
-            reservation.commit_tokens(0).await;
+            reservation
+                .commit_tokens(aisix_ratelimit::TokenCharge::NONE)
+                .await;
             let env = ErrorEnvelope::new(e.to_string(), "not_implemented");
             Ok(EmbedDispatchSuccess {
                 response: (StatusCode::NOT_IMPLEMENTED, Json(env)).into_response(),
@@ -850,10 +896,14 @@ fn emit_access_log(
 /// The prompt count an embeddings `usage` block reports: `prompt_tokens`, or
 /// `total_tokens` from a provider that reports only that (embeddings are
 /// input-only). `None` when it reports neither.
-fn reported_prompt_tokens(usage: &aisix_gateway::EmbeddingUsage) -> Option<u32> {
-    [usage.prompt_tokens, usage.total_tokens]
-        .into_iter()
-        .find(|&n| n > 0)
+pub(crate) fn reported_prompt_tokens(usage: &aisix_gateway::EmbeddingUsage) -> Option<u32> {
+    if usage.prompt_reported || usage.prompt_tokens > 0 {
+        Some(usage.prompt_tokens)
+    } else if usage.total_reported || usage.total_tokens > 0 {
+        Some(usage.total_tokens)
+    } else {
+        None
+    }
 }
 
 /// This endpoint's reading of an embeddings body's usage, shared with
@@ -967,7 +1017,7 @@ fn emit_usage_event(
         guardrail_scores: crate::usage_attr::guardrail_scores(audit),
         guardrail_bypassed_reason: crate::usage_attr::bypass_reason(audit),
         client_source_ip: client.source_ip.clone(),
-        client_user_agent: client.user_agent.clone(),
+        client_user_agent: client.user_agent.value.clone(),
         request_headers: client.request_headers.clone(),
         ..Default::default()
     };
@@ -1008,7 +1058,7 @@ fn emit_usage_event(
             cached: 0,
             cache_read: 0,
             cache_creation: 0,
-            client_type: state.client_classifier.classify(&client.user_agent),
+            client_type: client.client_type(),
         },
     );
 }
@@ -1082,7 +1132,7 @@ mod tests {
 
     fn provider_key_entry(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
         let json = format!(
-            r#"{{"display_name":"openai-up","secret":"sk-up","api_base":"{api_base}","provider":"openai","adapter":"openai"}}"#
+            r#"{{"display_name":"openai-up","api_key":"sk-up","api_base":"{api_base}","provider":"openai","adapter":"openai"}}"#
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
         ResourceEntry::new(PK_ID, pk, 1)
@@ -1099,7 +1149,7 @@ mod tests {
     /// vendor + PK label the dashboard's Logs detail shows.
     fn provider_key_entry_tagged(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
         let json = format!(
-            r#"{{"display_name":"openai-up","secret":"sk-up","api_base":"{api_base}","provider":"openai","adapter":"openai","telemetry_tags":{{"kind":"catalog","featured":true,"branded_provider":"openai","pk_label":"prod-embeddings-key"}}}}"#
+            r#"{{"display_name":"openai-up","api_key":"sk-up","api_base":"{api_base}","provider":"openai","adapter":"openai","telemetry_tags":{{"kind":"catalog","featured":true,"branded_provider":"openai","pk_label":"prod-embeddings-key"}}}}"#
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
         ResourceEntry::new(PK_ID, pk, 1)
@@ -1915,7 +1965,7 @@ mod tests {
 
         const ANTHROPIC_PK_ID: &str = "22222222-2222-2222-2222-222222222222";
 
-        let anthropic_pk_json = r#"{"display_name":"anthropic-up","secret":"sk-ant-test","provider":"anthropic","adapter":"anthropic"}"#;
+        let anthropic_pk_json = r#"{"display_name":"anthropic-up","api_key":"sk-ant-test","provider":"anthropic","adapter":"anthropic"}"#;
         let anthropic_pk: aisix_core::ProviderKey =
             serde_json::from_str(anthropic_pk_json).unwrap();
         let anthropic_pk_entry = ResourceEntry::new(ANTHROPIC_PK_ID, anthropic_pk, 1);

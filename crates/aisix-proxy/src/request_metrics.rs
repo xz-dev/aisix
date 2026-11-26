@@ -362,6 +362,8 @@ impl<'a> LastTarget<'a> {
 /// a session reports its tokens and cost, that reason is gone and it belongs
 /// with the rest.
 const LLM_ENDPOINTS: &[&str] = &[
+    crate::gemini::ENDPOINT,
+    crate::gemini::STREAM_ENDPOINT,
     "/v1/chat/completions",
     "/v1/completions",
     "/v1/embeddings",
@@ -379,6 +381,7 @@ const LLM_ENDPOINTS: &[&str] = &[
     "/v1/videos",
     "/v1/videos/:id",
     "/v1/realtime",
+    "/api-ws/v1/inference",
 ];
 
 /// Whether this endpoint's requests are model inference.
@@ -932,8 +935,7 @@ pub(crate) struct Tokens<'a> {
     pub cached: u32,
     pub cache_read: u32,
     pub cache_creation: u32,
-    /// Normalised inbound client for the by-client series
-    /// (`state.client_classifier.classify(&client.user_agent)`).
+    /// Inbound client classification captured at request entry.
     pub client_type: &'a str,
 }
 
@@ -1102,6 +1104,10 @@ mod tests {
     /// are what force a new endpoint's `endpoint` label and LLM-vs-proxy
     /// tier to be decided rather than defaulted.
     const ROUTES: &[&str] = &[
+        "/v1beta/models/example:generateContent",
+        "/v1beta/models/example:streamGenerateContent",
+        "/v1beta1/projects/example/locations/global/publishers/google/models/example:generateContent",
+        "/v1beta1/projects/example/locations/global/publishers/google/models/example:streamGenerateContent",
         "/v1/models",
         "/.well-known/oauth-protected-resource",
         "/.well-known/oauth-protected-resource/mcp",
@@ -1135,6 +1141,7 @@ mod tests {
         "/v1/videos/vid_abc123",
         "/v1/videos/vid_abc123/content",
         "/v1/realtime",
+        "/api-ws/v1/inference",
         "/v1/files",
         "/v1/files/file_abc123",
         "/v1/files/file_abc123/content",
@@ -1197,6 +1204,7 @@ mod tests {
             "/v1/videos/vid_abc123/content",
             // Moved in once realtime started reporting its tokens + cost.
             "/v1/realtime",
+            "/api-ws/v1/inference",
         ] {
             assert!(
                 is_llm_endpoint(crate::normalize_endpoint_label(route)),

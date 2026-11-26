@@ -615,7 +615,7 @@ impl VideoProvider {
     fn root(self, base: &str) -> &str {
         let trimmed = base.trim_end_matches('/');
         let suffixes: &[&str] = match self {
-            Self::Alibaba => &["/compatible-mode/v1", "/api/v1", "/v1"],
+            Self::Alibaba => return crate::dispatch::dashscope_native_root(trimmed),
             // The CP catalog pre-fills `https://open.bigmodel.cn/api/paas/v4`.
             Self::Zhipu => &["/api/paas/v4"],
             // The common Ark base is `https://ark.cn-beijing.volces.com/api/v3`.
@@ -1986,13 +1986,17 @@ async fn dispatch_create(
             d.value
         }
         Err(e) => {
-            reservation.commit_tokens(0).await;
+            reservation
+                .commit_tokens(aisix_ratelimit::TokenCharge::NONE)
+                .await;
             return Err(e);
         }
     };
     // Zero tokens on the videos surface — commit releases the
     // concurrency permit and finalises RPM.
-    reservation.commit_tokens(0).await;
+    reservation
+        .commit_tokens(aisix_ratelimit::TokenCharge::NONE)
+        .await;
     let (target, resp) = match submitted {
         Submitted::Accepted(target, resp) => (*target, resp),
         Submitted::Unsupported(unsupported) => {
@@ -2144,7 +2148,9 @@ pub async fn get_video(
         let reservation = crate::quota::enforce(&state, &snapshot, &auth, None).await?;
         crate::budget::gate(&state, &snapshot).check_provider_key(&target.pk_id)?;
         let result = poll_task(&state, &target, &task_id, &client.request_id).await;
-        reservation.commit_tokens(0).await;
+        reservation
+            .commit_tokens(aisix_ratelimit::TokenCharge::NONE)
+            .await;
         let poll = result?;
         // Echo the name the caller submitted under, not the row's own — the
         // two differ for a wildcard row, and the submit response already
@@ -2219,7 +2225,9 @@ pub async fn video_content(
         let reservation = crate::quota::enforce(&state, &snapshot, &auth, None).await?;
         crate::budget::gate(&state, &snapshot).check_provider_key(&target.pk_id)?;
         let result = poll_task(&state, &target, &task_id, &client.request_id).await;
-        reservation.commit_tokens(0).await;
+        reservation
+            .commit_tokens(aisix_ratelimit::TokenCharge::NONE)
+            .await;
         let poll = result?;
 
         let mut relays_body = false;
@@ -2357,7 +2365,7 @@ fn emit_submit_usage_event(
         guardrail_scores: crate::usage_attr::guardrail_scores(audit),
         guardrail_bypassed_reason: crate::usage_attr::bypass_reason(audit),
         client_source_ip: client.source_ip.clone(),
-        client_user_agent: client.user_agent.clone(),
+        client_user_agent: client.user_agent.value.clone(),
         request_headers: client.request_headers.clone(),
         ..Default::default()
     };
@@ -2774,7 +2782,7 @@ mod tests {
     fn new_snap(api_base: &str, provider: &str, model_extra: &str) -> AisixSnapshot {
         let snap = AisixSnapshot::new();
         let pk_json = format!(
-            r#"{{"display_name":"ali-up","secret":"sk-up","api_base":"{api_base}","provider":"{provider}"}}"#
+            r#"{{"display_name":"ali-up","api_key":"sk-up","api_base":"{api_base}","provider":"{provider}"}}"#
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&pk_json).unwrap();
         snap.provider_keys.insert(ResourceEntry::new(PK_ID, pk, 1));
@@ -3375,7 +3383,7 @@ mod tests {
 
         let snap = AisixSnapshot::new();
         let pk_json = format!(
-            r#"{{"display_name":"ali-up","secret":"sk-up","api_base":"{}","provider":"alibaba"}}"#,
+            r#"{{"display_name":"ali-up","api_key":"sk-up","api_base":"{}","provider":"alibaba"}}"#,
             upstream.uri()
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&pk_json).unwrap();
@@ -3453,7 +3461,7 @@ mod tests {
 
         let snap = AisixSnapshot::new();
         let pk_json = format!(
-            r#"{{"display_name":"ali-up","secret":"sk-up","api_base":"{}","provider":"alibaba"}}"#,
+            r#"{{"display_name":"ali-up","api_key":"sk-up","api_base":"{}","provider":"alibaba"}}"#,
             upstream.uri()
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&pk_json).unwrap();

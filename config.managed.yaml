@@ -100,7 +100,11 @@ etcd:
   # `request_timeout_ms` is unset by default, and unset means unbounded.
   # It bounds a single request/response call (the configuration range
   # read, creating the watch, the admin reads) but never the established
-  # watch stream. A `request_timeout_ms` the range read cannot finish
+  # watch stream. While it is unset, creating the watch and a one-key
+  # liveness read sent ahead of each unbounded read are still bounded, by
+  # `dial_timeout_ms x endpoints x 4` (at least 30 s; unbounded when
+  # `dial_timeout_ms` is 0), so a connection that cannot answer is replaced
+  # instead of waited on. A `request_timeout_ms` the range read cannot finish
   # inside makes the gateway retry it forever without ever serving
   # traffic, so leave it unset unless a slow etcd must fail fast.
   # dial_timeout_ms: 5000   # this is the default; 0 = unbounded
@@ -133,7 +137,10 @@ proxy:
   #   - addr: "0.0.0.0:3000"
   # Serving topology; on for Linux by default. A managed deployment
   # reaches these through the environment rather than by editing this
-  # file: AISIX_PROXY__THREAD_PER_CORE, AISIX_PROXY__WORKERS.
+  # file: AISIX_PROXY__THREAD_PER_CORE, AISIX_PROXY__WORKERS. `workers`
+  # also sizes the token-estimate pool: one thread per worker, each holding
+  # one tokenizer instance per encoding it has counted with (about 17 MiB
+  # cl100k, 27 MiB o200k, 39 MiB o200k_harmony).
   # thread_per_core: true
   # workers: 4
   # Headers a caller may hand the gateway its own request id in; that id
@@ -213,10 +220,9 @@ observability:
       # deployment and point Prometheus at it. Override with
       # AISIX_OBSERVABILITY__METRICS__PROMETHEUS__ADDR.
       addr: "0.0.0.0:9090"
-    # Optional User-Agent -> client_type mapping rules for the
-    # aisix_llm_tokens_by_client_total metric (first match wins, tried
-    # before the built-in allowlist; regex, case-insensitive). See
-    # config.example.yaml for the full annotation.
+    # Optional User-Agent rules for client_type in usage events, observability
+    # exports, and the aisix_llm_tokens_by_client_total metric. The first matching
+    # regex takes precedence over built-in clients. See config.example.yaml.
     # client_type_rules:
     #   - pattern: "^py-billing-batcher/"
     #     client: billing-batcher

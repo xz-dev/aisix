@@ -1417,31 +1417,57 @@ async fn multipart_dispatch(
                 let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
                 let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?;
 
-                // Cache key must be `'static`; both callers pass fixed literals.
-                let url_cache_key: &'static str = if upstream_path == "/audio/translations" {
-                    "proxy/audio/translations"
+                let azure = crate::dispatch::is_azure_key(&pk_entry.value);
+                let (url, auth) = if azure {
+                    let operation = if upstream_path == "/audio/translations" {
+                        aisix_provider_azure_openai::AzureOperation::AudioTranslations
+                    } else {
+                        aisix_provider_azure_openai::AzureOperation::AudioTranscriptions
+                    };
+                    crate::dispatch::azure_upstream(&pk_entry, &upstream_model, operation)
+                        .await
+                        .map_err(|e| {
+                            ProxyError::Bridge(crate::cooldown::note_failure(
+                                &state.runtime_status,
+                                &target.id,
+                                model.cooldown.as_ref(),
+                                e,
+                            ))
+                        })?
                 } else {
-                    "proxy/audio/transcriptions"
+                    // Cache key must be `'static`; both callers pass fixed literals.
+                    let url_cache_key: &'static str = if upstream_path == "/audio/translations" {
+                        "proxy/audio/translations"
+                    } else {
+                        "proxy/audio/transcriptions"
+                    };
+                    let url = aisix_gateway::url_cache::cached_endpoint_url(
+                        &pk_entry.id,
+                        url_cache_key,
+                        // Every resolve_base_url input, via the shared constructor
+                        // (#1017: the resolved URL depends on the vendor too), plus the
+                        // per-call path.
+                        &{
+                            let [base, vendor, adapter] =
+                                crate::dispatch::pk_url_fingerprint(&pk_entry.value);
+                            [base, vendor, adapter, upstream_path]
+                        },
+                        || {
+                            let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
+                            Ok::<_, crate::error::ProxyError>(crate::dispatch::build_openai_url(
+                                &base,
+                                upstream_path,
+                            ))
+                        },
+                    )?;
+                    let auth_hv = header::HeaderValue::from_str(&format!("Bearer {api_key}"))
+                        .map_err(|e| {
+                            ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
+                                "api key contains invalid header chars: {e}"
+                            )))
+                        })?;
+                    (url, (header::AUTHORIZATION, auth_hv))
                 };
-                let url = aisix_gateway::url_cache::cached_endpoint_url(
-                    &pk_entry.id,
-                    url_cache_key,
-                    // Every resolve_base_url input, via the shared constructor
-                    // (#1017: the resolved URL depends on the vendor too), plus the
-                    // per-call path.
-                    &{
-                        let [base, vendor, adapter] =
-                            crate::dispatch::pk_url_fingerprint(&pk_entry.value);
-                        [base, vendor, adapter, upstream_path]
-                    },
-                    || {
-                        let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
-                        Ok::<_, crate::error::ProxyError>(crate::dispatch::build_openai_url(
-                            &base,
-                            upstream_path,
-                        ))
-                    },
-                )?;
                 let provider_label = provider.to_ascii_lowercase();
 
                 // Rebuild the multipart form with `model` rewritten. A `multipart::Form`
@@ -1484,13 +1510,7 @@ async fn multipart_dispatch(
                 // is left to `.multipart()` (it sets the boundary). Reserved auth
                 // headers are protected by `apply_request_headers`.
                 let mut headers = axum::http::HeaderMap::new();
-                let auth_hv =
-                    header::HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
-                        ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
-                            "api key contains invalid header chars: {e}"
-                        )))
-                    })?;
-                headers.insert(header::AUTHORIZATION, auth_hv);
+                headers.insert(auth.0, auth.1);
                 let rid_hv = header::HeaderValue::from_str(request_id).map_err(|e| {
                     ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
                         "request_id contains invalid header chars: {e}"
@@ -1572,7 +1592,7 @@ async fn multipart_dispatch(
                                 aisix_gateway::upstream_error_within(
                                     connect_deadline,
                                     resp,
-                                    aisix_provider_openai::held_route_http_error,
+                                    |resp| crate::dispatch::held_route_http_error(azure, resp),
                                 )
                                 .await,
                             ));
@@ -1639,7 +1659,9 @@ async fn multipart_dispatch(
     } = match dispatched {
         Ok(d) => d,
         Err(e) => {
-            reservation.commit_tokens(0).await;
+            reservation
+                .commit_tokens(aisix_ratelimit::TokenCharge::NONE)
+                .await;
             return Err(e);
         }
     };
@@ -1733,7 +1755,10 @@ async fn multipart_dispatch(
                         duration_cost_basis(outcome.duration_seconds, || probed_seconds);
                     let total = u64::from(usage.prompt_tokens) + u64::from(usage.completion_tokens);
                     for key in &post_stream_keys {
-                        limiter.add_tokens_post_stream(key, total);
+                        limiter.add_tokens_post_stream(
+                            key,
+                            aisix_ratelimit::TokenCharge::reported(total),
+                        );
                     }
                     drop(stream_hold);
                     drop(in_flight_hold);
@@ -1879,7 +1904,9 @@ async fn multipart_dispatch(
     let total_tokens = usage.as_ref().map_or(0, |u| {
         u64::from(u.prompt_tokens) + u64::from(u.completion_tokens)
     });
-    reservation.commit_tokens(total_tokens).await;
+    reservation
+        .commit_tokens(aisix_ratelimit::TokenCharge::reported(total_tokens))
+        .await;
 
     // #696: run the output guardrail chain on the transcript — it is
     // caller-visible model output, scanned like chat's replies. Pre-fix an
@@ -2283,14 +2310,46 @@ async fn speech_dispatch(
                 crate::util::outbound_json(body)?
             };
 
+            let azure = crate::dispatch::is_azure_key(&pk_entry.value);
+            let (speech_url, auth) = if azure {
+                crate::dispatch::azure_upstream(
+                    &pk_entry,
+                    &upstream_model,
+                    aisix_provider_azure_openai::AzureOperation::AudioSpeech,
+                )
+                .await
+                .map_err(|e| {
+                    ProxyError::Bridge(crate::cooldown::note_failure(
+                        &state.runtime_status,
+                        &target.id,
+                        model.cooldown.as_ref(),
+                        e,
+                    ))
+                })?
+            } else {
+                let speech_url = aisix_gateway::url_cache::cached_endpoint_url(
+                    &pk_entry.id,
+                    "proxy/audio/speech",
+                    // Every resolve_base_url input (#1017) via the shared constructor.
+                    &crate::dispatch::pk_url_fingerprint(&pk_entry.value),
+                    || {
+                        let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
+                        Ok::<_, crate::error::ProxyError>(crate::dispatch::build_openai_url(
+                            &base,
+                            "/audio/speech",
+                        ))
+                    },
+                )?;
+                let auth_hv =
+                    header::HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
+                        ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
+                            "api key contains invalid header chars: {e}"
+                        )))
+                    })?;
+                (speech_url, (header::AUTHORIZATION, auth_hv))
+            };
             let mut headers = axum::http::HeaderMap::new();
-            let auth_hv =
-                header::HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
-                    ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
-                        "api key contains invalid header chars: {e}"
-                    )))
-                })?;
-            headers.insert(header::AUTHORIZATION, auth_hv);
+            headers.insert(auth.0, auth.1);
             headers.insert(
                 header::CONTENT_TYPE,
                 header::HeaderValue::from_static("application/json"),
@@ -2317,19 +2376,6 @@ async fn speech_dispatch(
 
             let client =
                 crate::http_client::client_for(pk_entry.value.upstream_connection().as_ref());
-            let speech_url = aisix_gateway::url_cache::cached_endpoint_url(
-                &pk_entry.id,
-                "proxy/audio/speech",
-                // Every resolve_base_url input (#1017) via the shared constructor.
-                &crate::dispatch::pk_url_fingerprint(&pk_entry.value),
-                || {
-                    let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
-                    Ok::<_, crate::error::ProxyError>(crate::dispatch::build_openai_url(
-                        &base,
-                        "/audio/speech",
-                    ))
-                },
-            )?;
             let tracker = &state.runtime_status;
             let model_id: &str = &target.id;
             let cooldown_cfg = model.cooldown.as_ref();
@@ -2376,11 +2422,9 @@ async fn speech_dispatch(
                             tracker,
                             model_id,
                             cooldown_cfg,
-                            aisix_gateway::upstream_error_within(
-                                stream_budget,
-                                resp,
-                                aisix_provider_openai::held_route_http_error,
-                            )
+                            aisix_gateway::upstream_error_within(stream_budget, resp, |resp| {
+                                crate::dispatch::held_route_http_error(azure, resp)
+                            })
                             .await,
                         ));
                     }
@@ -2411,7 +2455,9 @@ async fn speech_dispatch(
     } = match dispatched {
         Ok(d) => d,
         Err(e) => {
-            reservation.commit_tokens(0).await;
+            reservation
+                .commit_tokens(aisix_ratelimit::TokenCharge::NONE)
+                .await;
             return Err(e);
         }
     };
@@ -2815,7 +2861,7 @@ fn emit_usage_event(
         inbound_protocol: "openai".to_string(),
         applied_guardrails: applied_guardrails.to_vec(),
         client_source_ip: client.source_ip.clone(),
-        client_user_agent: client.user_agent.clone(),
+        client_user_agent: client.user_agent.value.clone(),
         request_headers: client.request_headers.clone(),
         redacted_entity_counts,
         guardrail_monitor_hits,
@@ -2870,7 +2916,7 @@ fn emit_usage_event(
             cached: 0,
             cache_read: 0,
             cache_creation: 0,
-            client_type: state.client_classifier.classify(&client.user_agent),
+            client_type: client.client_type(),
         },
     );
 }
@@ -2995,7 +3041,7 @@ mod tests {
 
     fn provider_key_entry(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
         let json = format!(
-            r#"{{"display_name":"openai-up","secret":"sk-up","api_base":"{api_base}","provider":"openai","adapter":"openai"}}"#
+            r#"{{"display_name":"openai-up","api_key":"sk-up","api_base":"{api_base}","provider":"openai","adapter":"openai"}}"#
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
         ResourceEntry::new(PK_ID, pk, 1)
@@ -3011,7 +3057,7 @@ mod tests {
     /// parity) for asserting they land on the emitted UsageEvent.
     fn provider_key_entry_tagged(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
         let json = format!(
-            r#"{{"display_name":"openai-up","secret":"sk-up","api_base":"{api_base}","provider":"openai","adapter":"openai","telemetry_tags":{{"kind":"catalog","featured":true,"branded_provider":"openai","pk_label":"prod-audio-key"}}}}"#
+            r#"{{"display_name":"openai-up","api_key":"sk-up","api_base":"{api_base}","provider":"openai","adapter":"openai","telemetry_tags":{{"kind":"catalog","featured":true,"branded_provider":"openai","pk_label":"prod-audio-key"}}}}"#
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
         ResourceEntry::new(PK_ID, pk, 1)
@@ -3029,7 +3075,7 @@ mod tests {
     /// must apply to the upstream request.
     fn provider_key_entry_overrides(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
         let json = format!(
-            r#"{{"display_name":"openai-up","secret":"sk-up","api_base":"{api_base}","provider":"openai","adapter":"openai","request":{{"default_body_fields":{{"safe_flag":true}},"default_headers":{{"x-custom":"trace-on"}}}}}}"#
+            r#"{{"display_name":"openai-up","api_key":"sk-up","api_base":"{api_base}","provider":"openai","adapter":"openai","request":{{"default_body_fields":{{"safe_flag":true}},"default_headers":{{"x-custom":"trace-on"}}}}}}"#
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
         ResourceEntry::new(PK_ID, pk, 1)

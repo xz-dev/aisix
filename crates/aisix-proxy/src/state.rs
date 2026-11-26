@@ -295,6 +295,8 @@ pub struct ProxyStateInner {
     /// The `budgets` documents indexed for the per-request budget gate,
     /// rebuilt only when that table changes.
     pub(crate) budgets: Arc<crate::budget::LiveBudgetIndex>,
+    /// Whether configuration comes from a control plane.
+    pub managed: bool,
     /// Per-model health tracker. Updated on every upstream call outcome;
     /// read by `GET /admin/v1/health`.
     pub health: Arc<HealthTracker>,
@@ -452,6 +454,7 @@ impl ProxyState {
             mcp_oauth: Arc::new(aisix_mcp::UserOAuthManager::new(Arc::clone(&shared_store))),
             session_pins: Arc::new(crate::session_affinity::SessionPins::new(shared_store)),
             budgets: Arc::new(crate::budget::LiveBudgetIndex::default()),
+            managed: false,
             health: Arc::new(HealthTracker::new()),
             livez: Arc::new(LivezState::new()),
             config_apply_age: None,
@@ -510,6 +513,7 @@ impl ProxyState {
             mcp_oauth: Arc::new(aisix_mcp::UserOAuthManager::new(Arc::clone(&shared_store))),
             session_pins: Arc::new(crate::session_affinity::SessionPins::new(shared_store)),
             budgets: Arc::new(crate::budget::LiveBudgetIndex::default()),
+            managed: false,
             health: Arc::new(HealthTracker::new()),
             livez: Arc::new(LivezState::new()),
             config_apply_age: None,
@@ -582,6 +586,7 @@ impl ProxyState {
             mcp_oauth: Arc::new(aisix_mcp::UserOAuthManager::new(Arc::clone(&shared_store))),
             session_pins: Arc::new(crate::session_affinity::SessionPins::new(shared_store)),
             budgets: Arc::new(crate::budget::LiveBudgetIndex::default()),
+            managed: false,
             health: Arc::new(HealthTracker::with_flags(bookkeeping_flags)),
             livez: Arc::new(LivezState::new()),
             config_apply_age: None,

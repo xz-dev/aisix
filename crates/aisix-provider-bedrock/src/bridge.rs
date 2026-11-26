@@ -1350,6 +1350,8 @@ impl Bridge for BedrockBridge {
                 // The upstream reports no total; the one above is the prompt
                 // count, filled for the client.
                 upstream_total_tokens: 0,
+                prompt_reported: matches!(source, EmbeddingUsageSource::Reported),
+                total_reported: false,
                 source,
             },
         })
@@ -2657,6 +2659,7 @@ fn converse_output_into_chat_response(
     let usage = resp
         .usage()
         .map(|u| UsageStats {
+            reported: aisix_gateway::ReportedCounts::BOTH,
             prompt_tokens: u.input_tokens().max(0) as u32,
             completion_tokens: u.output_tokens().max(0) as u32,
             total_tokens: u.total_tokens().max(0) as u32,
@@ -2914,6 +2917,7 @@ fn emit_converse_chunk(
                     delta: ChatDelta::default(),
                     finish_reason: None,
                     usage: Some(UsageStats {
+                        reported: aisix_gateway::ReportedCounts::BOTH,
                         prompt_tokens: u.input_tokens.max(0) as u32,
                         completion_tokens: u.output_tokens.max(0) as u32,
                         total_tokens: u.total_tokens.max(0) as u32,
@@ -4006,7 +4010,7 @@ mod tests {
     /// URI to drive `bridge.chat()` end-to-end.
     fn sample_pk_with_secret(secret_json: &str) -> Arc<ProviderKey> {
         let cfg = format!(
-            r#"{{"display_name": "bedrock-prod", "secret": {}}}"#,
+            r#"{{"display_name": "bedrock-prod", "api_key": {}}}"#,
             serde_json::to_string(secret_json).unwrap()
         );
         Arc::new(serde_json::from_str(&cfg).unwrap())
@@ -6877,7 +6881,7 @@ mod tests {
         Arc::new(
             serde_json::from_value(serde_json::json!({
                 "display_name": "bedrock-prod",
-                "secret": valid_secret_json(),
+                "api_key": valid_secret_json(),
                 "request": request,
             }))
             .expect("provider_key with request overrides deserializes"),
@@ -6889,7 +6893,7 @@ mod tests {
         Arc::new(
             serde_json::from_value(serde_json::json!({
                 "display_name": "bedrock-prod",
-                "secret": valid_secret_json(),
+                "api_key": valid_secret_json(),
                 "response": response,
             }))
             .expect("provider_key with response overrides deserializes"),

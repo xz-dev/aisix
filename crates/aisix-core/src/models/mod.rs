@@ -1,8 +1,8 @@
 //! Typed entities persisted in etcd and loaded into the gateway snapshot.
 //!
-//! Each entity is paired with a JSON Schema (spec §3) compiled once at
-//! startup and reused on both the declarative write paths and the
-//! watch read path.
+//! Each entity is paired with a JSON Schema (spec §3): a strict one
+//! published as the write contract, and a lenient one the loader compiles
+//! once and runs on every configuration source and on watch events.
 //!
 //! Entities landing across the live PR series:
 //! - [`Model`] — routing target (§3)
@@ -43,13 +43,15 @@ pub mod semantic;
 pub mod snapshot;
 pub mod tags;
 pub mod team;
+pub mod usage_accounting;
 pub mod user;
 
 pub use a2a_agent::{A2aAgent, A2aAuthType, A2aProtocolVersion};
 pub use apikey::{ApiKey, McpServerLimit};
 pub use budget::{
-    Budget, BudgetExhausted, BudgetFailMode, BudgetMemberExhausted, BudgetPeriod, BudgetPolicy,
-    BudgetReason, BudgetScope, BudgetTag,
+    budget_next_period_start, budget_period_start, parse_budget_timezone, Budget, BudgetExhausted,
+    BudgetFailMode, BudgetMemberExhausted, BudgetPeriod, BudgetPolicy, BudgetReason, BudgetScope,
+    BudgetTag,
 };
 pub use cache_policy::{AppliesTo, CacheBackend, CachePolicy, CacheScope, SemanticCacheConfig};
 pub use claim_mapping::{ClaimMapping, ClaimMatch, ClaimMatchOp, ClaimResolve};
@@ -113,7 +115,8 @@ pub use schema::{
     validate_oidc_provider, validate_oidc_provider_lenient, validate_passthrough_route,
     validate_passthrough_route_lenient, validate_pricing, validate_pricing_lenient,
     validate_provider_key, validate_provider_key_lenient, validate_rate_limit_policy,
-    validate_rate_limit_policy_lenient, validate_team, validate_team_lenient, validate_user,
+    validate_rate_limit_policy_lenient, validate_team, validate_team_lenient,
+    validate_usage_accounting, validate_usage_accounting_lenient, validate_user,
     validate_user_lenient, SchemaError,
 };
 pub use semantic::{
@@ -124,4 +127,5 @@ pub use semantic::{
 pub use snapshot::{AisixSnapshot, KeyOwnerNames};
 pub use tags::{effective_tags, is_valid_tag_key, tag_value_from_claim, Tags, TAG_KEY_PATTERN};
 pub use team::Team;
+pub use usage_accounting::UsageAccounting;
 pub use user::User;

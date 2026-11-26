@@ -345,6 +345,7 @@ pub fn parse_openai_error_envelope(body: &[u8]) -> Option<aisix_gateway::Upstrea
         message: outer.error.message,
         code: text(outer.error.code),
         param: text(outer.error.param),
+        native_body: None,
     })
 }
 
@@ -546,13 +547,15 @@ impl Bridge for OpenAiBridge {
         let body = {
             let messages = messages_from(&req, developer_role_mode(ctx));
             let typed = build_request(&req, upstream, &messages, false);
-            outbound_bytes(&prepare_outbound_body(
+            let outbound = prepare_outbound_body(
                 &typed,
                 req.gateway_strict_schema,
                 renames_token_cap(ctx, upstream),
                 ctx.provider_key.request.as_ref(),
                 ctx.provider_key.response.as_ref(),
-            )?)?
+            )?;
+            ctx.note_chat_audio_format(&outbound);
+            outbound_bytes(&outbound)?
         };
         // The owned request is not needed past its wire bytes.
         drop(req);
@@ -788,13 +791,15 @@ impl Bridge for OpenAiBridge {
         let body = {
             let messages = messages_from(&req, developer_role_mode(ctx));
             let typed = build_request(&req, upstream, &messages, true);
-            outbound_bytes(&prepare_outbound_body(
+            let outbound = prepare_outbound_body(
                 &typed,
                 req.gateway_strict_schema,
                 renames_token_cap(ctx, upstream),
                 ctx.provider_key.request.as_ref(),
                 ctx.provider_key.response.as_ref(),
-            )?)?
+            )?;
+            ctx.note_chat_audio_format(&outbound);
+            outbound_bytes(&outbound)?
         };
         // The owned request is not needed past its wire bytes.
         drop(req);
@@ -1094,7 +1099,7 @@ mod tests {
 
     fn sample_provider_key(base: &str) -> Arc<ProviderKey> {
         let cfg = format!(
-            r#"{{"display_name": "openai-prod", "secret": "sk-test", "api_base": "{base}"}}"#
+            r#"{{"display_name": "openai-prod", "api_key": "sk-test", "api_base": "{base}"}}"#
         );
         Arc::new(serde_json::from_str(&cfg).unwrap())
     }
@@ -1482,7 +1487,7 @@ mod tests {
         // surface a 401 authentication_error rather than calling
         // upstream with a bare bearer (#367 follow-up).
         let mut pk: ProviderKey =
-            serde_json::from_str(r#"{"display_name":"empty","secret":"placeholder"}"#).unwrap();
+            serde_json::from_str(r#"{"display_name":"empty","api_key":"placeholder"}"#).unwrap();
         pk.api_key.clear();
 
         let bridge = OpenAiBridge::new();
@@ -1686,13 +1691,13 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
 
         // No api_base set → falls back to OPENAI_DEFAULT_BASE.
         let pk_default: ProviderKey =
-            serde_json::from_str(r#"{"display_name":"x","secret":"k"}"#).unwrap();
+            serde_json::from_str(r#"{"display_name":"x","api_key":"k"}"#).unwrap();
         let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk_default));
         assert_eq!(bridge.resolve_base(&ctx).unwrap(), OPENAI_DEFAULT_BASE);
 
         // api_base override: trailing slash stripped.
         let pk_override: ProviderKey = serde_json::from_str(
-            r#"{"display_name":"x","secret":"k","api_base":"https://proxy.example.com/v1/"}"#,
+            r#"{"display_name":"x","api_key":"k","api_base":"https://proxy.example.com/v1/"}"#,
         )
         .unwrap();
         let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk_override));
@@ -1703,14 +1708,14 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
     }
 
     fn pk_with_base(api_base: &str) -> ProviderKey {
-        let cfg = format!(r#"{{"display_name":"x","secret":"k","api_base":"{api_base}"}}"#);
+        let cfg = format!(r#"{{"display_name":"x","api_key":"k","api_base":"{api_base}"}}"#);
         serde_json::from_str(&cfg).unwrap()
     }
 
     #[test]
     fn developer_role_mode_matches_provider_endpoint_identity() {
         let legacy_pk: ProviderKey =
-            serde_json::from_str(r#"{"display_name":"x","secret":"k"}"#).unwrap();
+            serde_json::from_str(r#"{"display_name":"x","api_key":"k"}"#).unwrap();
         let legacy_ctx = BridgeContext::new("rid", sample_model(), Arc::new(legacy_pk));
         assert_eq!(
             developer_role_mode(&legacy_ctx),
@@ -1730,7 +1735,7 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
         );
 
         let deepseek_pk: ProviderKey = serde_json::from_str(
-            r#"{"display_name":"ds","secret":"k","provider":"deepseek","adapter":"openai","api_base":"https://api.deepseek.com"}"#,
+            r#"{"display_name":"ds","api_key":"k","provider":"deepseek","adapter":"openai","api_base":"https://api.deepseek.com"}"#,
         )
         .unwrap();
         let deepseek_ctx = BridgeContext::new("rid", sample_model(), Arc::new(deepseek_pk));
@@ -1740,7 +1745,7 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
         );
 
         let openai_pk: ProviderKey = serde_json::from_str(
-            r#"{"display_name":"oai","secret":"k","provider":" OpenAI ","adapter":"openai","api_base":"https://proxy.example/v1"}"#,
+            r#"{"display_name":"oai","api_key":"k","provider":" OpenAI ","adapter":"openai","api_base":"https://proxy.example/v1"}"#,
         )
         .unwrap();
         let openai_ctx = BridgeContext::new("rid", sample_model(), Arc::new(openai_pk));
@@ -1784,7 +1789,7 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
             " openrouter ",
         ] {
             let pk: ProviderKey = serde_json::from_str(&format!(
-                r#"{{"display_name":"x","secret":"k","provider":"{vendor}","adapter":"openai"}}"#
+                r#"{{"display_name":"x","api_key":"k","provider":"{vendor}","adapter":"openai"}}"#
             ))
             .unwrap();
             let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk));
@@ -1820,7 +1825,7 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
     fn family_bridge_allows_openai_vendor_with_empty_api_base() {
         let bridge = OpenAiBridge::new();
         let pk: ProviderKey = serde_json::from_str(
-            r#"{"display_name":"oai","secret":"sk-oai","provider":"openai","adapter":"openai"}"#,
+            r#"{"display_name":"oai","api_key":"sk-oai","provider":"openai","adapter":"openai"}"#,
         )
         .unwrap();
         let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk));
@@ -1835,7 +1840,8 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
     #[test]
     fn family_bridge_allows_legacy_empty_provider_with_empty_api_base() {
         let bridge = OpenAiBridge::new();
-        let pk: ProviderKey = serde_json::from_str(r#"{"display_name":"x","secret":"k"}"#).unwrap();
+        let pk: ProviderKey =
+            serde_json::from_str(r#"{"display_name":"x","api_key":"k"}"#).unwrap();
         let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk));
         assert_eq!(bridge.resolve_base(&ctx).unwrap(), OPENAI_DEFAULT_BASE);
     }
@@ -1848,7 +1854,7 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
     fn family_bridge_allows_non_openai_vendor_with_populated_api_base() {
         let bridge = OpenAiBridge::new();
         let pk: ProviderKey = serde_json::from_str(
-            r#"{"display_name":"xai","secret":"sk-xai","provider":"xai","adapter":"openai","api_base":"https://api.x.ai/v1"}"#,
+            r#"{"display_name":"xai","api_key":"sk-xai","provider":"xai","adapter":"openai","api_base":"https://api.x.ai/v1"}"#,
         )
         .unwrap();
         let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk));
@@ -1912,7 +1918,7 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
 
     fn pk_with_overrides(base: &str, overrides_json: &str) -> Arc<ProviderKey> {
         let cfg = format!(
-            r#"{{"display_name": "openai-prod", "secret": "sk-test", "api_base": "{base}", {overrides_json}}}"#
+            r#"{{"display_name": "openai-prod", "api_key": "sk-test", "api_base": "{base}", {overrides_json}}}"#
         );
         Arc::new(serde_json::from_str(&cfg).unwrap())
     }

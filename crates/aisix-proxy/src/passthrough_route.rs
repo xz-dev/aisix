@@ -62,7 +62,9 @@
 //!   fall into a typed route that happens to share the path (forward-proxy
 //!   traffic: a TLS-terminating device delivers e.g.
 //!   `Host: api.githubcopilot.com` with its original path). On a host
-//!   match the middleware dispatches straight to [`entry`].
+//!   match the middleware dispatches straight to [`entry`]. Existing
+//!   path mounts for Gemini generation also take this path, preserving
+//!   their routing and authentication when the gateway is upgraded.
 //!
 //! ## Auth
 //!
@@ -175,7 +177,11 @@ pub async fn host_dispatch(
     next: Next,
 ) -> Response {
     let snapshot = state.snapshot.load();
-    let matched = has_host_match(&snapshot, inbound_host(&req).as_deref());
+    let path = req.uri().path();
+    let matched = has_host_match(&snapshot, inbound_host(&req).as_deref())
+        || (req.method() == axum::http::Method::POST
+            && crate::gemini::path(path).is_some()
+            && match_route(&snapshot, None, path).is_some());
     drop(snapshot);
     if matched {
         use tower::ServiceExt;
@@ -1053,7 +1059,7 @@ async fn dispatch(
         anonymous: auth.anonymous,
         client_identity,
         client_source_ip: client.source_ip.clone(),
-        client_user_agent: client.user_agent.clone(),
+        user_agent: client.user_agent.clone(),
         request_headers: client.request_headers.clone(),
         started,
         attempt_started,
@@ -7025,7 +7031,7 @@ struct RouteTelemetry {
     anonymous: bool,
     client_identity: String,
     client_source_ip: String,
-    client_user_agent: String,
+    user_agent: Arc<crate::client_ip::InboundUserAgent>,
     request_headers: std::collections::BTreeMap<String, String>,
     started: Instant,
     /// When the upstream call itself began — the scope the two `upstream_*`
@@ -7336,7 +7342,7 @@ impl RouteTelemetry {
             passthrough_route_name: self.route_name.clone(),
             client_identity: self.client_identity.clone(),
             client_source_ip: self.client_source_ip.clone(),
-            client_user_agent: self.client_user_agent.clone(),
+            client_user_agent: self.user_agent.value.clone(),
             request_headers: self.request_headers.clone(),
             guardrail_blocked: self.guardrail_blocked,
             guardrail_monitor_hits: std::mem::take(&mut self.monitor_hits),
@@ -7380,10 +7386,7 @@ impl RouteTelemetry {
                     cached: usage.cached_prompt_tokens,
                     cache_read: usage.cache_read_tokens,
                     cache_creation: usage.cache_creation_tokens,
-                    client_type: self
-                        .state
-                        .client_classifier
-                        .classify(&self.client_user_agent),
+                    client_type: &self.user_agent.client_type,
                 },
             );
         }
@@ -7616,7 +7619,7 @@ mod tests {
 
     fn provider_key_entry(api_base_unused: &str) -> ResourceEntry<ProviderKey> {
         let json = format!(
-            r#"{{"display_name":"openai-up","secret":"sk-upstream","api_base":"{api_base_unused}","provider":"openai","adapter":"openai"}}"#
+            r#"{{"display_name":"openai-up","api_key":"sk-upstream","api_base":"{api_base_unused}","provider":"openai","adapter":"openai"}}"#
         );
         let pk: ProviderKey = serde_json::from_str(&json).unwrap();
         ResourceEntry::new(PK_ID, pk, 1)
@@ -10974,7 +10977,7 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
             .await;
 
         let snap = AisixSnapshot::new();
-        let pk_json = r#"{"display_name":"openai-up","secret":"sk-upstream","api_base":"http://unused",
+        let pk_json = r#"{"display_name":"openai-up","api_key":"sk-upstream","api_base":"http://unused",
                  "provider":"openai","adapter":"openai","strip_headers":[]}"#;
         let pk: ProviderKey = serde_json::from_str(pk_json).unwrap();
         snap.provider_keys.insert(ResourceEntry::new(PK_ID, pk, 1));
@@ -11223,7 +11226,7 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
         // the glob firing. Without one in the strip set, a passthrough
         // route forwards it by default whatever the patterns say — an
         // assertion that proves nothing about this rule.
-        let pk_json = r#"{"display_name":"openai-up","secret":"sk-upstream",
+        let pk_json = r#"{"display_name":"openai-up","api_key":"sk-upstream",
              "api_base":"http://unused","provider":"openai","adapter":"openai",
              "strip_headers":["authorization","x-api-key","x-gw-key","x-end-user",
                               "x-stripped-control"]}"#;

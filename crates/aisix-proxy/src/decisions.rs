@@ -612,7 +612,9 @@ async fn dispatch(
     } = match dispatched {
         Ok(d) => d,
         Err(e) => {
-            reservation.commit_tokens(0).await;
+            reservation
+                .commit_tokens(aisix_ratelimit::TokenCharge::NONE)
+                .await;
             return Err(e);
         }
     };
@@ -648,7 +650,9 @@ async fn dispatch(
     };
     let usage = usage.unwrap_or_default();
     reservation
-        .commit_tokens(u64::from(usage.input) + u64::from(usage.output))
+        .commit_tokens(aisix_ratelimit::TokenCharge::reported(
+            u64::from(usage.input) + u64::from(usage.output),
+        ))
         .await;
 
     let client_body = match (answers, &converted) {
@@ -707,7 +711,7 @@ async fn dispatch(
 /// Apply the Provider Key's `request.*` body overrides, as every other
 /// directly-built upstream request does. A no-op without overrides, so the
 /// verbatim body is only re-serialised when an operator asked for a change.
-fn apply_body_overrides(
+pub(crate) fn apply_body_overrides(
     pk: &aisix_core::ProviderKey,
     outbound: Bytes,
 ) -> Result<Bytes, ProxyError> {
@@ -733,6 +737,21 @@ fn apply_body_overrides(
 /// Endpoint a `typesafe` Provider Key reaches when it sets no `api_base`.
 const TYPESAFE_DEFAULT_API_BASE: &str = crate::semantic::TYPESAFE_DEFAULT_API_BASE;
 
+/// The System One endpoint a `typesafe` Provider Key reaches. Shared with
+/// the semantic router's classifier, so a classifier call and a direct
+/// `POST /v1/systemone` on the same key go to the same URL.
+pub(crate) fn typesafe_systemone_url(pk: &aisix_core::ProviderKey) -> String {
+    let base = pk
+        .api_base
+        .as_deref()
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .unwrap_or(TYPESAFE_DEFAULT_API_BASE)
+        .trim_end_matches('/');
+    let base = base.strip_suffix("/systemone").unwrap_or(base);
+    format!("{}/v1/systemone", base.strip_suffix("/v1").unwrap_or(base))
+}
+
 fn upstream_url(upstream: Upstream, pk: &aisix_core::ProviderKey) -> Result<String, ProxyError> {
     let configured = pk
         .api_base
@@ -740,12 +759,7 @@ fn upstream_url(upstream: Upstream, pk: &aisix_core::ProviderKey) -> Result<Stri
         .map(str::trim)
         .filter(|b| !b.is_empty());
     Ok(match upstream {
-        Upstream::TypeSafe => {
-            let base = configured.unwrap_or(TYPESAFE_DEFAULT_API_BASE);
-            let base = base.trim_end_matches('/');
-            let base = base.strip_suffix("/systemone").unwrap_or(base);
-            format!("{}/v1/systemone", base.strip_suffix("/v1").unwrap_or(base))
-        }
+        Upstream::TypeSafe => typesafe_systemone_url(pk),
         Upstream::Foundry => {
             let base = configured.ok_or_else(|| {
                 ProxyError::InvalidRequest(format!(
@@ -863,7 +877,7 @@ fn emit_usage_event(
         provider_model_version: success.reported_model.clone(),
         inbound_protocol: "openai".to_string(),
         client_source_ip: client.source_ip.clone(),
-        client_user_agent: client.user_agent.clone(),
+        client_user_agent: client.user_agent.value.clone(),
         request_headers: client.request_headers.clone(),
         ..Default::default()
     };
@@ -902,7 +916,7 @@ fn emit_usage_event(
             cached: usage.cached,
             cache_read: 0,
             cache_creation: 0,
-            client_type: state.client_classifier.classify(&client.user_agent),
+            client_type: client.client_type(),
         },
     );
 }
@@ -989,7 +1003,7 @@ mod tests {
             Some("https://api.typesafe.ai/v1/systemone"),
         ] {
             let pk: aisix_core::ProviderKey = serde_json::from_value(serde_json::json!({
-                "display_name": "ts", "secret": "k", "provider": "typesafe", "api_base": base,
+                "display_name": "ts", "api_key": "k", "provider": "typesafe", "api_base": base,
             }))
             .unwrap();
             assert_eq!(
@@ -1059,7 +1073,7 @@ mod tests {
         let snap = aisix_core::AisixSnapshot::new();
         let pk: aisix_core::ProviderKey = serde_json::from_value(serde_json::json!({
             "display_name": "foundry",
-            "secret": secret,
+            "api_key": secret,
             "api_base": format!("{}/api/projects/p1", server.uri()),
             "provider": "azure",
             "adapter": "azure-openai",

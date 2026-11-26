@@ -7,12 +7,11 @@
 //! built here so no call site can drift back onto tonic's default; test
 //! fixtures that talk to etcd directly are their own business.
 
-use etcd_client::{Client, ConnectOptions, Error as EtcdError, KvClient, WatchClient};
+use etcd_client::{Client, ConnectOptions, Error as EtcdError, GetOptions, KvClient, WatchClient};
 use std::error::Error as StdError;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::sync::Mutex;
 
 /// Maximum size, in bytes, of a gRPC message decoded from etcd.
 ///
@@ -96,7 +95,9 @@ pub(crate) fn format_error_chain(err: &(dyn StdError + 'static)) -> String {
 pub enum ConnectError {
     /// No server answered: TCP refused, DNS failure, TLS handshake
     /// failure, an expired `etcd.dial_timeout_ms`, or an etcd that is up
-    /// but cannot serve (no leader, shutting down). Retryable.
+    /// but cannot serve (no leader, shutting down) — or etcd answered
+    /// with anything that is not a verdict on the credentials (see
+    /// [`classify`]). Retryable.
     #[error("etcd did not answer: {0}")]
     Unreachable(String),
     /// etcd answered and refused — a wrong user or password, a user
@@ -129,15 +130,37 @@ pub enum ConnectError {
 /// (<https://grpc.io/docs/guides/status-codes/>). Compared numerically so
 /// this crate does not have to depend on — and keep in step with — the
 /// exact `tonic` release `etcd-client` builds against.
-const GRPC_CANCELLED: i32 = 1;
-const GRPC_UNKNOWN: i32 = 2;
-const GRPC_DEADLINE_EXCEEDED: i32 = 4;
-const GRPC_RESOURCE_EXHAUSTED: i32 = 8;
-const GRPC_ABORTED: i32 = 10;
-const GRPC_INTERNAL: i32 = 13;
-const GRPC_UNAVAILABLE: i32 = 14;
 const GRPC_INVALID_ARGUMENT: i32 = 3;
+const GRPC_PERMISSION_DENIED: i32 = 7;
+const GRPC_FAILED_PRECONDITION: i32 = 9;
+const GRPC_UNIMPLEMENTED: i32 = 12;
 const GRPC_UNAUTHENTICATED: i32 = 16;
+
+/// etcd's answers that are a verdict on the configured credentials but
+/// share a status code with answers that are not: `InvalidArgument` also
+/// carries malformed-request answers, `FailedPrecondition` also carries
+/// `not leader`, `not capable` and the learner refusals, which a cluster
+/// electing or catching up sends and then stops sending, and
+/// `Unimplemented` is any service or method the server lacks. Matched
+/// by message for the same reason as [`STALE_TOKEN_MESSAGES`].
+const CREDENTIAL_REFUSAL_MESSAGES: [(i32, &str); 3] = [
+    // In full: `etcdserver: authentication failed, invalid user ID or
+    // password`.
+    (GRPC_INVALID_ARGUMENT, "etcdserver: authentication failed"),
+    (
+        GRPC_FAILED_PRECONDITION,
+        "etcdserver: authentication is not enabled",
+    ),
+    // Credentials sent to a server with no Auth service at all — kine,
+    // and the control plane's DPM, which embeds it.
+    (GRPC_UNIMPLEMENTED, "unknown service etcdserverpb.Auth"),
+];
+
+fn is_credential_refusal(code: i32, message: &str) -> bool {
+    CREDENTIAL_REFUSAL_MESSAGES
+        .iter()
+        .any(|(c, m)| *c == code && message.contains(m))
+}
 
 /// etcd's own error strings for the two answers that mean "the token you
 /// sent is stale" but arrive as `InvalidArgument`, sharing a status code
@@ -191,12 +214,23 @@ impl ConnectError {
 
 /// Sort one `etcd-client` failure into [`ConnectError`].
 ///
-/// The split is structural, on the gRPC status code — never on the text
-/// of a message. Verified against etcd 3.5 and etcd-client 0.14: a
-/// refused TCP connect, a DNS failure and a failed TLS handshake all
-/// arrive as `GRpcStatus` with code `Unavailable` (tonic manufactures
-/// the status locally; the message is "tcp connect error" / "dns error"
-/// / "tls handshake eof"), while a wrong password arrives as
+/// [`ConnectError::Rejected`] is reserved for etcd's verdicts on the
+/// credentials and their permissions; every other answer is retried. A
+/// status outside that set — `OutOfRange` for a revision the server has
+/// not caught up to or has compacted, `NotFound`, `Unimplemented`,
+/// `DataLoss`, a code this list has never heard of — says nothing an
+/// operator can fix, and treating it as a refusal would either end the
+/// boot or, on the shared catalog, stop watching it until the cycle next
+/// restarts.
+///
+/// The split is on the gRPC status code, and on the message only where
+/// etcd puts a refusal and a passing condition under one code (see
+/// [`CREDENTIAL_REFUSAL_MESSAGES`] and [`STALE_TOKEN_MESSAGES`]).
+/// Verified against etcd 3.5 and etcd-client 0.14: a refused TCP
+/// connect, a DNS failure and a failed TLS handshake all arrive as
+/// `GRpcStatus` with code `Unavailable` (tonic manufactures the status
+/// locally; the message is "tcp connect error" / "dns error" / "tls
+/// handshake eof"), while a wrong password arrives as
 /// `InvalidArgument` carrying etcd's own "authentication failed, invalid
 /// user ID or password".
 ///
@@ -215,33 +249,14 @@ impl ConnectError {
 /// `PermissionDenied`; neither can reach the retry path however many
 /// times it is presented.
 ///
-/// `InvalidArgument` is not only that, though, which is why two of its
-/// members are named by message below. See [`STALE_TOKEN_MESSAGES`].
+/// `InvalidArgument` is not only that, though, which is why its members
+/// are named by message below.
 pub(crate) fn classify(err: &EtcdError) -> ConnectError {
     let detail = format_etcd_error(err);
     match err {
         // The call never reached a server.
         EtcdError::TransportError(_) | EtcdError::IoError(_) => ConnectError::Unreachable(detail),
         EtcdError::GRpcStatus(status) => match status.code() as i32 {
-            // `Unavailable` is both what tonic synthesises for every
-            // failure to reach a server and what etcd itself answers
-            // while it has no leader or is stopping. `DeadlineExceeded`
-            // is a call that ran out of time. `Unknown` and `Internal`
-            // are what a connection broken mid-call surfaces as.
-            // `Cancelled` and `Aborted` are what a peer or an
-            // intermediary resetting the stream produces — an ingress in
-            // front of etcd restarting looks like this — and
-            // `ResourceExhausted` is an etcd throttling a fleet of
-            // gateways that all restarted at once. None of them is an
-            // answer about the credentials, and all of them heal on
-            // their own.
-            GRPC_UNAVAILABLE
-            | GRPC_DEADLINE_EXCEEDED
-            | GRPC_UNKNOWN
-            | GRPC_INTERNAL
-            | GRPC_CANCELLED
-            | GRPC_ABORTED
-            | GRPC_RESOURCE_EXHAUSTED => ConnectError::Unreachable(detail),
             // etcd knows the call arrived with a token it no longer
             // holds — the TTL elapsed, or its token store was cleared.
             // The configured credentials are not what it is complaining
@@ -253,16 +268,44 @@ pub(crate) fn classify(err: &EtcdError) -> ConnectError {
             GRPC_INVALID_ARGUMENT if is_stale_token(status.message()) => {
                 ConnectError::Unauthenticated(detail)
             }
-            // Everything else is etcd having evaluated the request and
-            // said no: the rest of `InvalidArgument` — a wrong user or
-            // password — `PermissionDenied` for a user without the
-            // rights, `FailedPrecondition` for credentials sent to a
-            // cluster that has authentication disabled.
-            _ => ConnectError::Rejected(detail),
+            // etcd's verdicts on the credentials: a user without the
+            // rights, a wrong user or password, credentials sent to a
+            // cluster that has authentication disabled or to a server
+            // with no Auth service.
+            GRPC_PERMISSION_DENIED => ConnectError::Rejected(detail),
+            code if is_credential_refusal(code, status.message()) => ConnectError::Rejected(detail),
+            // Everything else heals without anyone editing a config.
+            // `Unavailable` is both what tonic synthesises for every
+            // failure to reach a server and what etcd itself answers
+            // while it has no leader or is stopping. `DeadlineExceeded`
+            // is a call that ran out of time. `Unknown` and `Internal`
+            // are what a connection broken mid-call surfaces as.
+            // `Cancelled` and `Aborted` are what a peer or an
+            // intermediary resetting the stream produces — an ingress in
+            // front of etcd restarting looks like this — and
+            // `ResourceExhausted` is an etcd throttling a fleet of
+            // gateways that all restarted at once. `OutOfRange` is a
+            // revision the server has not caught up to yet, or has
+            // compacted.
+            _ => ConnectError::Unreachable(detail),
         },
+        // The stream closed before etcd confirmed the watch: a
+        // connection problem, not an answer.
+        EtcdError::WatchError(_) => ConnectError::Unreachable(detail),
         // Unparseable endpoints, an empty endpoint list, a bad header
         // value: configuration, not reachability.
         _ => ConnectError::Rejected(detail),
+    }
+}
+
+/// Whether `err` came from the connection rather than from etcd: tonic
+/// attaches the transport or HTTP/2 cause as the status source, while a
+/// status etcd sent itself has none.
+pub(crate) fn failed_on_transport(err: &EtcdError) -> bool {
+    match err {
+        EtcdError::TransportError(_) | EtcdError::IoError(_) => true,
+        EtcdError::GRpcStatus(status) => StdError::source(status).is_some(),
+        _ => false,
     }
 }
 
@@ -294,7 +337,7 @@ pub enum CallError {
 /// reports the other half of the same wait: that gate explains why the
 /// proxy listener is still closed, this one explains why no configuration
 /// has arrived to open it.
-const DIAL_WAIT_LOG_INTERVAL: Duration = Duration::from_secs(10);
+pub(crate) const DIAL_WAIT_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Run `fut`, saying every `interval` that it has not finished yet.
 ///
@@ -309,10 +352,10 @@ const DIAL_WAIT_LOG_INTERVAL: Duration = Duration::from_secs(10);
 ///
 /// First tick one interval in, not immediately, so a healthy dial — which
 /// finishes in milliseconds — logs nothing at all.
-async fn announce_while_pending<T>(
+pub(crate) async fn announce_while_pending<T>(
     interval: Duration,
-    endpoints: &[String],
     fut: impl Future<Output = T>,
+    on_tick: impl Fn(Duration),
 ) -> T {
     tokio::pin!(fut);
     let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
@@ -329,14 +372,7 @@ async fn announce_while_pending<T>(
             // tick reports success rather than one last complaint.
             biased;
             outcome = &mut fut => return outcome,
-            _ = ticker.tick() => {
-                tracing::warn!(
-                    endpoints = ?endpoints,
-                    waited_secs = started.elapsed().as_secs(),
-                    "still connecting to etcd — nothing waiting on this connection can \
-                     proceed until it answers",
-                );
-            }
+            _ = ticker.tick() => on_tick(started.elapsed()),
         }
     }
 }
@@ -366,7 +402,11 @@ pub struct LazyEtcdClient {
     /// is what an explicit `dial_timeout_ms: 0` asks for; omitting the
     /// key gets `aisix_core::DEFAULT_ETCD_DIAL_TIMEOUT_MS` per endpoint.
     dial_timeout: Option<Duration>,
-    connected: Mutex<Option<Connected>>,
+    connected: std::sync::Mutex<Option<Connected>>,
+    /// Serializes dials, so concurrent first calls wait for one dial
+    /// rather than opening a connection each. Kept apart from `connected`
+    /// so retiring a connection never waits behind a dial.
+    dialing: tokio::sync::Mutex<()>,
     /// Handed to the next connection [`LazyEtcdClient::dial`] establishes.
     /// See [`Connected::generation`].
     next_generation: AtomicU64,
@@ -406,6 +446,20 @@ impl std::fmt::Debug for LazyEtcdClient {
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// SO_KEEPALIVE idle time on etcd sockets, for a connection that carries
+/// no stream and so gets no HTTP/2 PING.
+const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
+
+/// How many dial budgets a [`LazyEtcdClient::probe`] may take. The probe
+/// carries channel establishment (TCP, TLS, `Authenticate`), which the
+/// dial budget is sized for, plus one tiny read; the rest is headroom for
+/// a server queueing reads behind a fleet that reconnected at once.
+const PROBE_BOUND_DIAL_BUDGETS: u32 = 4;
+
+/// Floor under [`LazyEtcdClient::probe_bound`], so a dial budget tuned
+/// short for fast failover does not also cut a read the server queued.
+const PROBE_BOUND_FLOOR: Duration = Duration::from_secs(30);
+
 impl LazyEtcdClient {
     pub fn new(
         endpoints: Vec<String>,
@@ -421,10 +475,12 @@ impl LazyEtcdClient {
                     // `ConnectOptions::new()` turns idle pings on, and a
                     // server that does not permit them sends GOAWAY
                     // `too_many_pings` to a connection with no stream.
-                    .with_keep_alive_while_idle(false),
+                    .with_keep_alive_while_idle(false)
+                    .with_tcp_keepalive(TCP_KEEPALIVE),
             ),
             dial_timeout,
-            connected: Mutex::new(None),
+            connected: std::sync::Mutex::new(None),
+            dialing: tokio::sync::Mutex::new(()),
             next_generation: AtomicU64::new(0),
         }
     }
@@ -440,21 +496,29 @@ impl LazyEtcdClient {
     /// The connection, dialling if this is the first call to get there,
     /// and the generation it belongs to — what [`Self::invalidate`] needs
     /// to replace exactly this connection.
-    ///
-    /// The lock is held across the dial on purpose: concurrent first
-    /// calls wait for the one dial rather than opening a connection each.
     async fn connection(&self) -> Result<(Client, u64), ConnectError> {
-        let mut slot = self.connected.lock().await;
-        if let Some(connected) = slot.as_ref() {
-            return Ok((connected.client.clone(), connected.generation));
+        if let Some(found) = self.cached() {
+            return Ok(found);
+        }
+        let _dialing = self.dialing.lock().await;
+        if let Some(found) = self.cached() {
+            return Ok(found);
         }
         let client = self.dial().await?;
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
-        *slot = Some(Connected {
+        *self.connected.lock().unwrap() = Some(Connected {
             client: client.clone(),
             generation,
         });
         Ok((client, generation))
+    }
+
+    fn cached(&self) -> Option<(Client, u64)> {
+        self.connected
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|c| (c.client.clone(), c.generation))
     }
 
     /// Discard the connection `stale` names so the next call dials a new
@@ -462,8 +526,8 @@ impl LazyEtcdClient {
     ///
     /// A no-op once someone else has already replaced that generation —
     /// see [`Connected::generation`].
-    async fn invalidate(&self, stale: u64) {
-        let mut slot = self.connected.lock().await;
+    pub(crate) fn invalidate(&self, stale: u64) {
+        let mut slot = self.connected.lock().unwrap();
         if slot.as_ref().is_some_and(|c| c.generation == stale) {
             *slot = None;
         }
@@ -492,11 +556,22 @@ impl LazyEtcdClient {
     /// as [`CallError`]'s two timeout variants say — rather than the pair
     /// of them together, so a re-authenticated retry gets the same window
     /// the original call had instead of whatever was left of it.
-    pub async fn call<T, F, Fut>(
+    pub async fn call<T, F, Fut>(&self, timeout: Option<Duration>, op: F) -> Result<T, CallError>
+    where
+        F: FnMut(Client) -> Fut,
+        Fut: Future<Output = Result<T, EtcdError>>,
+    {
+        self.call_tagged(timeout, op).await.map(|(value, _)| value)
+    }
+
+    /// [`Self::call`], also returning the generation of the connection
+    /// the call succeeded on — for a stream that outlives the call and
+    /// must be able to retire that connection when it breaks.
+    pub async fn call_tagged<T, F, Fut>(
         &self,
         timeout: Option<Duration>,
         mut op: F,
-    ) -> Result<T, CallError>
+    ) -> Result<(T, u64), CallError>
     where
         F: FnMut(Client) -> Fut,
         Fut: Future<Output = Result<T, EtcdError>>,
@@ -514,35 +589,85 @@ impl LazyEtcdClient {
             let call = op(client);
             let outcome = match timeout {
                 None => call.await,
-                Some(d) => tokio::time::timeout(d, call)
-                    .await
-                    .map_err(|_| CallError::CallTimeout(d))?,
+                Some(d) => match tokio::time::timeout(d, call).await {
+                    Ok(outcome) => outcome,
+                    Err(_) => {
+                        self.invalidate(generation);
+                        return Err(CallError::CallTimeout(d));
+                    }
+                },
             };
 
-            match outcome {
-                Ok(value) => return Ok(value),
-                Err(err) if !reauthenticated => {
-                    let ConnectError::Unauthenticated(detail) = classify(&err) else {
-                        return Err(CallError::Call(err));
-                    };
+            let err = match outcome {
+                Ok(value) => return Ok((value, generation)),
+                Err(err) => err,
+            };
+            match classify(&err) {
+                ConnectError::Unauthenticated(detail) if !reauthenticated => {
                     tracing::info!(
                         error = %detail,
                         "etcd no longer accepts this connection's auth token — \
                          authenticating again and retrying",
                     );
-                    self.invalidate(generation).await;
+                    self.invalidate(generation);
                     reauthenticated = true;
                 }
-                Err(err) => return Err(CallError::Call(err)),
+                // A transport failure, not an answer from etcd (an etcd
+                // without a leader keeps its connection). The channel may
+                // be wedged rather than merely failed:
+                // tonic reconnects inside the same channel, and a
+                // reconnect whose TLS handshake never completes holds
+                // every later call on it forever. Only a new channel is
+                // certain to dial again.
+                _ if failed_on_transport(&err) => {
+                    self.invalidate(generation);
+                    return Err(CallError::Call(err));
+                }
+                _ => return Err(CallError::Call(err)),
             }
         }
+    }
+
+    /// The bound on [`Self::probe`]: [`PROBE_BOUND_DIAL_BUDGETS`] dial
+    /// budgets, at least [`PROBE_BOUND_FLOOR`]. `None` only when
+    /// `etcd.dial_timeout_ms` is an explicit `0`.
+    pub fn probe_bound(&self) -> Option<Duration> {
+        self.dial_timeout.map(|d| {
+            d.saturating_mul(PROBE_BOUND_DIAL_BUDGETS)
+                .max(PROBE_BOUND_FLOOR)
+        })
+    }
+
+    /// A count-only read under [`Self::probe_bound`], run before a call
+    /// that is deliberately unbounded (the full configuration read) so
+    /// that a connection that cannot answer at all is found, and
+    /// replaced, in bounded time. `key` is read as a prefix when
+    /// `whole_prefix` is set — the caller picks a range its own reads are
+    /// already authorized for — and as one key otherwise.
+    pub async fn probe(&self, key: &[u8], whole_prefix: bool) -> Result<(), CallError> {
+        self.call(self.probe_bound(), |client| {
+            let key = key.to_vec();
+            let mut options = GetOptions::new().with_count_only();
+            if whole_prefix {
+                options = options.with_prefix();
+            }
+            async move { kv_client(&client).get(key, Some(options)).await.map(|_| ()) }
+        })
+        .await
     }
 
     async fn dial(&self) -> Result<Client, ConnectError> {
         let connect = announce_while_pending(
             DIAL_WAIT_LOG_INTERVAL,
-            &self.endpoints,
             Client::connect(&self.endpoints, self.options.clone()),
+            |waited| {
+                tracing::warn!(
+                    endpoints = ?self.endpoints,
+                    waited_secs = waited.as_secs(),
+                    "still connecting to etcd — nothing waiting on this connection can \
+                     proceed until it answers",
+                )
+            },
         );
         let outcome = match self.dial_timeout {
             None => connect.await,
@@ -632,6 +757,14 @@ mod tests {
         // empty endpoint list dialable — so it is fatal, not a wait.
         let err = EtcdError::InvalidArgs("empty endpoints".to_string());
         assert!(matches!(classify(&err), ConnectError::Rejected(_)));
+    }
+
+    #[test]
+    fn a_watch_closed_before_its_create_answer_is_retried() {
+        // etcd-client's own error for a watch stream that ended before the
+        // server confirmed the create: the connection went, nobody refused.
+        let err = EtcdError::WatchError("failed to create watch".to_string());
+        assert!(matches!(classify(&err), ConnectError::Unreachable(_)));
     }
 
     #[tokio::test]
@@ -895,6 +1028,142 @@ mod reauth_tests {
             1,
             "a refused credential must not cause a re-dial",
         );
+    }
+
+    /// Answers every call on every connection with `Unavailable`, except
+    /// that the first `silent` connections are accepted and never spoken
+    /// to — the shape of a reconnect stuck in a handshake.
+    async fn spawn_partly_silent_etcd(silent: usize) -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let conns = connections.clone();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                if conns.fetch_add(1, Ordering::Relaxed) < silent {
+                    held.push(socket);
+                    continue;
+                }
+                tokio::spawn(async move {
+                    let Ok(mut conn) = h2::server::handshake(socket).await else {
+                        return;
+                    };
+                    while let Some(Ok((_req, mut respond))) = conn.accept().await {
+                        let response = http::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/grpc")
+                            .header("grpc-status", "14")
+                            .header("grpc-message", "etcdserver: no leader")
+                            .body(())
+                            .unwrap();
+                        let _ = respond.send_response(response, true);
+                    }
+                });
+            }
+        });
+        (format!("http://{addr}"), connections)
+    }
+
+    async fn read_on(client: &LazyEtcdClient, timeout: Option<Duration>) -> Result<(), CallError> {
+        client
+            .call(timeout, |c| async move {
+                kv_client(&c).get("/aisix", None).await.map(|_| ())
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn a_call_that_outruns_its_bound_retires_the_connection() {
+        // A channel whose connect never completes holds every later call
+        // on it. Retiring it on the timeout is what lets the next call
+        // reach a server that answers.
+        let (endpoint, connections) = spawn_partly_silent_etcd(1).await;
+        let client = LazyEtcdClient::new(vec![endpoint], None, None);
+
+        let err = read_on(&client, Some(Duration::from_millis(300)))
+            .await
+            .expect_err("the first connection never answers");
+        assert!(matches!(err, CallError::CallTimeout(_)), "{err:?}");
+        assert!(
+            client.cached().is_none(),
+            "the timed-out connection must be retired"
+        );
+
+        let err = read_on(&client, Some(Duration::from_secs(5)))
+            .await
+            .expect_err("the server answers Unavailable");
+        assert!(
+            matches!(err, CallError::Call(_)),
+            "a new connection must answer: {err:?}"
+        );
+        assert_eq!(connections.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn an_answer_from_etcd_keeps_the_connection() {
+        // `no leader` is etcd speaking over a working connection; dialling
+        // again (and re-authenticating) would only add load to a cluster
+        // that is already struggling.
+        let (endpoint, connections) = spawn_partly_silent_etcd(0).await;
+        let client = LazyEtcdClient::new(vec![endpoint], None, None);
+        for _ in 0..2 {
+            read_on(&client, None).await.expect_err("Unavailable");
+            assert!(
+                client.cached().is_some(),
+                "an answer from etcd keeps the connection"
+            );
+        }
+        assert_eq!(connections.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn a_connection_lost_mid_call_is_retired() {
+        // The server drops the first TCP connection as soon as a request
+        // arrives on it: a transport failure, not an answer.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let conns = connections.clone();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                let first = conns.fetch_add(1, Ordering::Relaxed) == 0;
+                tokio::spawn(async move {
+                    let Ok(mut conn) = h2::server::handshake(socket).await else {
+                        return;
+                    };
+                    if first {
+                        let _ = conn.accept().await;
+                        return;
+                    }
+                    while let Some(Ok((_req, mut respond))) = conn.accept().await {
+                        let response = http::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/grpc")
+                            .header("grpc-status", "14")
+                            .body(())
+                            .unwrap();
+                        let _ = respond.send_response(response, true);
+                    }
+                });
+            }
+        });
+        let client = LazyEtcdClient::new(vec![format!("http://{addr}")], None, None);
+        let first = read_on(&client, Some(Duration::from_secs(5)))
+            .await
+            .expect_err("the connection is dropped");
+        let CallError::Call(err) = &first else {
+            panic!("{first:?}");
+        };
+        assert!(failed_on_transport(err), "{err:?}");
+        assert!(
+            client.cached().is_none(),
+            "the broken connection must be retired"
+        );
+        read_on(&client, Some(Duration::from_secs(5)))
+            .await
+            .expect_err("Unavailable");
+        assert_eq!(connections.load(Ordering::Relaxed), 2);
     }
 
     /// A writer every clone of which appends to the same buffer, so a

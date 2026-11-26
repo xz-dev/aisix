@@ -159,50 +159,50 @@ describe("direct-model effort mapping", () => {
 
     const openaiKey = await seed.createProviderKey({
       display_name: "effort-map-openai-key",
-      secret: "sk-openai-mock",
+      api_key: "sk-openai-mock",
       api_base: `${openai.baseUrl}/v1`,
     });
     const anthropicKey = await seed.createProviderKey({
       display_name: "effort-map-anthropic-key",
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-anthropic-mock",
+      api_key: "sk-anthropic-mock",
       api_base: anthropic.baseUrl,
     });
     const openaiStreamKey = await seed.createProviderKey({
       display_name: "effort-map-openai-stream-key",
-      secret: "sk-openai-stream-mock",
+      api_key: "sk-openai-stream-mock",
       api_base: `${openaiStream.baseUrl}/v1`,
     });
     const anthropicStreamKey = await seed.createProviderKey({
       display_name: "effort-map-anthropic-stream-key",
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-anthropic-stream-mock",
+      api_key: "sk-anthropic-stream-mock",
       api_base: anthropicStream.baseUrl,
     });
     const ensembleStreamKey = await seed.createProviderKey({
       display_name: "effort-map-ensemble-stream-key",
-      secret: "sk-ensemble-stream-mock",
+      api_key: "sk-ensemble-stream-mock",
       api_base: `${ensembleStream.baseUrl}/v1`,
     });
     const tokensOpenaiKey = await seed.createProviderKey({
       display_name: "effort-map-tokens-openai-key",
-      secret: "sk-tokens-openai-mock",
+      api_key: "sk-tokens-openai-mock",
       api_base: `${tokensOpenai.baseUrl}/v1`,
     });
     const tokensAnthropicKey = await seed.createProviderKey({
       display_name: "effort-map-tokens-anthropic-key",
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-tokens-anthropic-mock",
+      api_key: "sk-tokens-anthropic-mock",
       api_base: tokensAnthropic.baseUrl,
     });
     const tokensCountKey = await seed.createProviderKey({
       display_name: "effort-map-tokens-count-key",
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-tokens-count-mock",
+      api_key: "sk-tokens-count-mock",
       api_base: tokensCount.baseUrl,
     });
 
@@ -1391,8 +1391,8 @@ describe("direct-model effort mapping", () => {
 
 // The empty-string key stands for a request that sets no effort, and a
 // null value removes the effort field — so the pair asks to remove a field
-// the request never set. A rule that can never do anything is refused at
-// the write contract rather than stored and never read.
+// the request never set. Such a row does not load, from etcd or from a
+// resources file.
 describe("resources file: the not-set key may not map to null", () => {
   const BIN_PATH =
     process.env.AISIX_BIN ??
@@ -1400,15 +1400,17 @@ describe("resources file: the not-set key may not map to null", () => {
 
   const file = (mapping: string) =>
     [
-      '_format_version: "1"',
+      '_format_version: "2"',
       "provider_keys:",
-      "  - display_name: pk",
+      "  - id: 0b6f3c1e-2f0a-4c5e-9d55-7d1a8b0c2e11",
+      "    display_name: pk",
       "    api_key: sk-x",
       "models:",
-      "  - display_name: m",
+      "  - id: 6efd592d-a73b-573d-8e2c-e9e103692f92",
+      "    display_name: m",
       "    provider: openai",
       "    model_name: gpt-4o",
-      "    provider_key: pk",
+      "    provider_key_id: 0b6f3c1e-2f0a-4c5e-9d55-7d1a8b0c2e11",
       "    effort_mapping:",
       mapping,
     ].join("\n");
@@ -1440,26 +1442,6 @@ describe("resources file: the not-set key may not map to null", () => {
       const ok = await execFileP(BIN_PATH, ["validate", "--resources", good]);
       expect(ok.stdout).toContain("OK:");
 
-      // An empty target value asks to send an effort the gateway itself
-      // reads back as "no effort set".
-      for (const [label, mapping] of [
-        ["listed", '      medium: ""'],
-        ["not-set", '      "": ""'],
-      ]) {
-        const emptyValue = join(dir, `empty-${label}.yaml`);
-        await writeFile(emptyValue, file(mapping), "utf8");
-        let rejected: (Error & { code?: number; stderr?: string }) | undefined;
-        try {
-          await execFileP(BIN_PATH, ["validate", "--resources", emptyValue]);
-        } catch (e) {
-          rejected = e as Error & { code?: number; stderr?: string };
-        }
-        if (!rejected) {
-          throw new Error(`${label}: expected \`aisix validate\` to fail`);
-        }
-        expect(rejected.code, label).toBe(1);
-        expect(String(rejected.stderr), label).toContain("effort_mapping");
-      }
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
