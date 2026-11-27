@@ -1,0 +1,74 @@
+name: ghcr-ci
+on:
+  push:
+    branches: [ci/ai-gateway-v1.12.0-20261126]
+permissions:
+  contents: read
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    env:
+      APPROVED_SHA: "4f6dc20a5382baddf5db458ab85a6e0b76fa7d39"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check approved head
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor "$APPROVED_SHA" HEAD
+          test "$(git diff --name-only "$APPROVED_SHA" HEAD)" = .github/workflows/ghcr-ci.yml
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          echo "tag=ci-${APPROVED_SHA:0:10}" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-protoc
+      - name: Run proxy regression suite
+        run: cargo test --locked -p aisix-proxy --lib
+      - name: Build the aisix binary (Dockerfile packages bin/aisix-<arch>)
+        shell: bash
+        run: |
+          set -euo pipefail
+          AISIX_BUILD_SHA="${APPROVED_SHA:0:7}" AISIX_BUILD_VERSION="" scripts/build-image-binary.sh thin
+          ls -l bin/
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+          labels: |
+            org.opencontainers.image.revision=${{ env.APPROVED_SHA }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.tag }}
+          build-args: |
+            VERSION=${{ steps.meta.outputs.tag }}
+            COMMIT=${{ env.APPROVED_SHA }}
+            DATE=${{ steps.meta.outputs.date }}
+            BUILD_DATE=${{ steps.meta.outputs.date }}
+      - name: Output digest
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE: ${{ steps.meta.outputs.image }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "IMAGE_REF=${IMAGE}@${DIGEST}"
+          echo "Published \`${IMAGE}@${DIGEST}\` (revision ${APPROVED_SHA})" >> "$GITHUB_STEP_SUMMARY"
