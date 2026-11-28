@@ -581,7 +581,7 @@ impl Bridge for OpenAiBridge {
                 .await
                 .map_err(aisix_gateway::send_error)?;
 
-            aisix_gateway::note_upstream_response(resp.headers());
+            let resp = aisix_gateway::tap_upstream_response(resp);
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
@@ -636,7 +636,7 @@ impl Bridge for OpenAiBridge {
                 .await
                 .map_err(aisix_gateway::send_error)?;
 
-            aisix_gateway::note_upstream_response(resp.headers());
+            let resp = aisix_gateway::tap_upstream_response(resp);
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
@@ -699,7 +699,7 @@ impl Bridge for OpenAiBridge {
                 .await
                 .map_err(aisix_gateway::send_error)?;
 
-            aisix_gateway::note_upstream_response(resp.headers());
+            let resp = aisix_gateway::tap_upstream_response(resp);
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
@@ -759,7 +759,7 @@ impl Bridge for OpenAiBridge {
                 .await
                 .map_err(aisix_gateway::send_error)?;
 
-            aisix_gateway::note_upstream_response(resp.headers());
+            let resp = aisix_gateway::tap_upstream_response(resp);
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
@@ -826,7 +826,7 @@ impl Bridge for OpenAiBridge {
         })
         .await?;
 
-        aisix_gateway::note_upstream_response(resp.headers());
+        let resp = aisix_gateway::tap_upstream_response(resp);
         let status = resp.status();
         if !status.is_success() {
             return Err(
@@ -854,7 +854,7 @@ impl Bridge for OpenAiBridge {
         let request_id_for_log = ctx.request_id.clone();
 
         let header_tier = aisix_gateway::chat::gemini_header_service_tier(resp.headers());
-        let byte_stream = resp.bytes_stream();
+        let byte_stream = aisix_gateway::upstream_sse_stream(resp);
         let stream = build_chunk_stream(
             byte_stream,
             reasoning_path,
@@ -2220,11 +2220,9 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
     #[tokio::test]
     async fn chat_stream_extracts_reasoning_field_onto_canonical_slot() {
         let server = MockServer::builder().start().await;
-        // Upstream chunk uses `delta.thinking` (hypothetical vendor
-        // shape); after extract_reasoning_field the parsed chunk's
-        // delta should have reasoning_content="step1".
+        // The configured path takes precedence over all built-in fields.
         let sse = "\
-data: {\"id\":\"cmpl-r\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"thinking\":\"step1\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl-r\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"thinking\":\"step1\",\"reasoning_content\":\"canonical\",\"reasoning\":\"legacy\",\"reasoning_text\":\"fallback\"},\"finish_reason\":null}]}\n\n\
 data: [DONE]\n\n";
         Mock::given(method("POST"))
             .and(path("/chat/completions"))

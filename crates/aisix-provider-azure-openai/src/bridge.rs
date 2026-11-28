@@ -839,7 +839,7 @@ impl Bridge for AzureOpenAiBridge {
                 .await
                 .map_err(aisix_gateway::send_error)?;
 
-            aisix_gateway::note_upstream_response(resp.headers());
+            let resp = aisix_gateway::tap_upstream_response(resp);
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
@@ -894,7 +894,7 @@ impl Bridge for AzureOpenAiBridge {
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)?;
-            aisix_gateway::note_upstream_response(resp.headers());
+            let resp = aisix_gateway::tap_upstream_response(resp);
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
@@ -948,7 +948,7 @@ impl Bridge for AzureOpenAiBridge {
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)?;
-            aisix_gateway::note_upstream_response(resp.headers());
+            let resp = aisix_gateway::tap_upstream_response(resp);
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
@@ -1003,7 +1003,7 @@ impl Bridge for AzureOpenAiBridge {
         })
         .await?;
 
-        aisix_gateway::note_upstream_response(resp.headers());
+        let resp = aisix_gateway::tap_upstream_response(resp);
         let status = resp.status();
         if !status.is_success() {
             return Err(
@@ -1037,7 +1037,7 @@ impl Bridge for AzureOpenAiBridge {
         // off just because its total duration exceeds one gap's budget.
         let per_chunk_timeout = ctx.deadline;
 
-        let byte_stream = resp.bytes_stream();
+        let byte_stream = aisix_gateway::upstream_sse_stream(resp);
         let stream = build_chunk_stream(
             byte_stream,
             reasoning_path,
